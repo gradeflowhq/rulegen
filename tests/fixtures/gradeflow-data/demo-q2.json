@@ -1,0 +1,35 @@
+{
+  "dataset": "gradeflow-data/demo",
+  "source_files": [
+    "demo/demo-1-questions.yaml",
+    "demo/demo-1-rules.yaml",
+    "demo/submissions.csv"
+  ],
+  "question": {
+    "question_id": "q2-mcq",
+    "description": "Select the exact set of choices required by the demo answer key.",
+    "max_points": 1,
+    "allow_multiple": true,
+    "options": {
+      "a": "Demo option A",
+      "b": "Demo option B",
+      "c": "Demo option C",
+      "d": "Demo option D"
+    },
+    "config": {
+      "delimiter": ",",
+      "empty_marker": "N/A",
+      "normalize_case": true,
+      "trim_whitespace": true
+    }
+  },
+  "teacher_instruction": "Award full credit if and only if the submitted set is exactly choices a and b. Every other selection receives zero points.",
+  "accepted_choices": ["a", "b"],
+  "examples": [
+    {"raw_answer": "a", "label": {"case_id": "demo-case-1", "expected_points": 0}},
+    {"raw_answer": "b", "label": {"case_id": "demo-case-2", "expected_points": 0}},
+    {"raw_answer": "a,b", "label": {"case_id": "demo-case-3", "expected_points": 1}},
+    {"raw_answer": "c", "label": {"case_id": "demo-case-4", "expected_points": 0}},
+    {"raw_answer": "d", "label": {"case_id": "demo-case-5", "expected_points": 0}}
+  ]
+}

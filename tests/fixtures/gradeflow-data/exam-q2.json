@@ -1,0 +1,37 @@
+{
+  "dataset": "gradeflow-data/exam",
+  "source_files": [
+    "exam/exam-questions.yaml",
+    "exam/Export-Final.csv"
+  ],
+  "question": {
+    "question_id": "Q2",
+    "description": "1B. [2 marks] A Meeting Room Scheduler receives batches of booking and cancellation requests once per hour and assigns each pending request to one of three rooms or rejects it. Booked rooms remain unavailable for the booking duration, assignments can fail because of external disruptions, and competing valid assignments must be compared. It is evaluated on both the number of successfully fulfilled requests and how well capacity and equipment match each request. Which agent type is the simplest and most appropriate? Types are listed from simplest to most complex: simple-reflex, model-based reflex, goal-based, utility-based.",
+    "max_points": 2,
+    "allow_multiple": false,
+    "options": {
+      "a": "Simple reflex agent",
+      "b": "Model-based reflex agent",
+      "c": "Goal-based agent",
+      "d": "Utility-based agent"
+    },
+    "config": {
+      "delimiter": ",",
+      "empty_marker": "N/A",
+      "normalize_case": true,
+      "trim_whitespace": true
+    }
+  },
+  "teacher_instruction": "Award 2 points only for the correct agent type; no partial credit.",
+  "accepted_choices": ["d"],
+  "examples": [
+    {"raw_answer": "D", "label": {"case_id": "exam-case-1", "expected_points": 2}},
+    {"raw_answer": "a", "label": {"case_id": "exam-case-2", "expected_points": 0}},
+    {"raw_answer": "D", "label": {"case_id": "exam-case-3", "expected_points": 2}},
+    {"raw_answer": "D", "label": {"case_id": "exam-case-4", "expected_points": 2}},
+    {"raw_answer": "D", "label": {"case_id": "exam-case-5", "expected_points": 2}},
+    {"raw_answer": "a", "label": {"case_id": "exam-case-6", "expected_points": 0}},
+    {"raw_answer": "D", "label": {"case_id": "exam-case-7", "expected_points": 2}},
+    {"raw_answer": "c", "label": {"case_id": "exam-case-8", "expected_points": 0}}
+  ]
+}

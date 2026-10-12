@@ -20,15 +20,17 @@
 ### FR2. Rule proposal generation
 
 - `rulegen` shall generate one or more structured rule proposals for each selected target using the configured LLM provider.
-- `rulegen` shall support only rule families declared compatible with every question in the target.
+- `rulegen` shall support only compatible, registered generation families. Length, Bonus, Composite, single-question Assumption Set, and Multi Valued are supported alongside the existing families. Every nested value rule must be compatible with its trusted question or component slot. Code, code tests, regex, similarity, and transformer generation remain excluded recursively.
 - (Tentative) The system shall return structured statuses such as `needs_context`, `needs_clarification`, `no_safe_candidate`, `verified`, and `unresolved`.
 - A grouped global rule shall apply only to the explicitly selected group and shall evaluate the group questions together.
 
-### FR3. Validation and compilation
+### FR3. Engine-derived authoring and validation
 
-- Every LLM response shall undergo local Pydantic/schema validation against a strict, versioned, request-scoped contract before it is used.
+- `RuleGenerator.generate()` shall be the supported public generation entry point. Its LLM calls shall request JSON Schema structured output with `strict: True`; provider enforcement of the supplied request-specific authoring schema shall be an explicit package contract. Local Pydantic validation shall validate the response envelope, whose `rule: dict[str, Any]` field does not independently validate the detailed nested authoring schema.
 - Local `rulegen` validation shall verify response structure, allowed rule families, referenced question and evidence identifiers, trusted choice identifiers, and consistency with authoritative teacher labels.
-- Compilation shall deterministically translate a validated intermediate strategy into a temporary engine-owned rule model without assigning durable IDs or modifying question metadata.
+- Rule structure shall derive from explicitly approved engine Pydantic models. New families require whitelist review; new engine fields remain unavailable to authoring unless explicitly whitelisted.
+- The authoring schema shall restrict allowed fields, rule kinds, question targets, and nested rule shapes, with `additionalProperties: false`. Hydration shall rely on provider enforcement of that schema and retain the original engine class's `model_validate(data)` for construction, defaults, normalization, and model validation. Choice arrays shall use normal engine normalization before generation-specific validation.
+- Hydration shall supply trusted target IDs and engine-default metadata without assigning durable IDs or modifying question metadata.
 - Engine-side validation shall confirm question existence, rule-question compatibility, rubric semantics, unique target questions, safe execution semantics, and compatibility with the full rubric.
 
 ### FR4. Testing and verification
@@ -41,7 +43,7 @@
 - The system shall provide observed scores, feedback, mismatches, coverage, and representative-sample composition as proposal evidence.
 - The LLM shall verify the candidate against the LLM's inferred teacher’s intent and observed engine behaviour.
 - Failed validation or verification may trigger bounded retry or regeneration.
-- `rulegen` shall stop when the retry limit, quota budget, or time budget is reached, and return the latest valid proposal.
+- `rulegen` shall stop when its retry or resource budget is reached. Only candidates that completed behavioral verification may be returned as applyable proposals; exhausted attempts return diagnostics without authorizing application.
 
 ### FR5. Teacher review and refinement
 
@@ -113,11 +115,10 @@
 ### NFR6. Maintainability and extensibility
 
 - `rulegen` shall use the LiteLLM Python SDK as its LLM client, calling configured providers through LiteLLM's common API rather than maintaining a parallel provider-client abstraction.
-- Provider-specific RuleGen code shall be limited to compatibility behavior proven necessary by integration checks; all provider responses shall still pass RuleGen's strict local Pydantic and domain validation. SoC-LaaS may omit the observed unsupported `uniqueItems` keyword from its wire schema only; local uniqueness validation and provenance of schema changes shall remain intact.
-- The package shall be independently versioned and pinned to a compatible engine version.
+- All provider responses shall pass RuleGen's strict local response-envelope validation, engine model validation, and semantic/contextual validation. Provider-facing JSON Schemas shall use keywords supported by the configured structured-output providers. `validate_rule()` shall retain checks for duplicates, numeric bounds, compatibility, and constraints omitted from the provider schema. Refusals, truncation, and provider failures shall remain handled by the bounded generation workflow.
 - Backend, `rulegen`, and engine responsibilities shall remain separated:
   - Backend: authorization, persistence, configuration, and transactions.
-  - `rulegen`: proposal generation, validation, compilation, testing, verification, and ranking.
+  - `rulegen`: proposal generation, validation, testing, verification, and ranking.
   - Engine: rule semantics, validation, execution, and grading.
 
 ### NFR7. Testing and deployment
