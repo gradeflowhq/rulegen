@@ -207,3 +207,48 @@ Keep helpers and fixtures local when only one test file uses them. Share reusabl
 helpers through `tests/support/`, and keep suite-wide fixtures in
 `tests/conftest.py`. Test files must not import other `test_*.py` modules.
 The integration layout and opt-in `live_soc` policy remain unchanged.
+
+## Running tests
+
+After installing the development dependencies above, run these commands from
+the `rulegen/` directory:
+
+```bash
+pytest
+```
+
+The default suite includes unit and integration tests, excludes tests marked
+`live_soc`, and blocks network access. No provider credentials are needed.
+
+Run a subset or check coverage with:
+
+```bash
+pytest tests/unit/
+pytest tests/integration/
+pytest tests/unit/test_generator.py
+pytest --cov=rulegen --cov-report=term-missing
+```
+
+The coverage check requires at least 90% coverage, as configured in
+`pyproject.toml`.
+
+### Live SoC-LaaS tests
+
+Live tests call the configured provider and consume tokens. Copy `.env.example`
+to `.env` in `rulegen/` and set `SOCLAAS_BASE_URL`, `SOCLAAS_API_KEY`, and
+`SOCLAAS_MODEL`. These tests read configuration directly from that file rather
+than from shell credentials.
+
+Explicitly enable and select the live tests with:
+
+```bash
+RULEGEN_RUN_LIVE_SOC=1 pytest -m live_soc
+```
+
+### Other development checks
+
+```bash
+ruff check .
+ruff format --check .
+mypy src/rulegen
+```
