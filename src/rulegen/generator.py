@@ -6,7 +6,7 @@ import json
 import logging
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from typing import Literal, Protocol, TypeAlias, TypeVar, cast
 
@@ -42,19 +42,22 @@ from .llm_payloads import (
     llm_answer,
 )
 from .models import (
-    BehavioralContract,
+    MAX_TEST_RESULT_IDS,
+    ModelCaseExpectation,
     NoSafeCandidate,
     RegenerationFailure,
-    SynthesisResult,
+    SynthesisResponse,
     VerificationFailureReason,
     VerificationResult,
     Verified,
 )
 from .preflight import preflight_check
 from .prompts import (
+    REQUEST_PAYLOAD_SEPARATOR,
     FormatRetryContext,
     generation_messages,
     group_generation_messages,
+    payload_from_message,
     verification_messages,
 )
 from .registry import resolve_target_rule_kinds
@@ -180,34 +183,38 @@ def _token_count(usage: object, name: str) -> int | None:
 # endregion
 
 
-class MessagesFactory(Protocol):
-    def __call__(
-        self, *, format_retry: FormatRetryContext | None
-    ) -> tuple[ChatMessage, ChatMessage]: ...
+class MessageBuilder(Protocol):
+    def __call__(self, *, format_retry: FormatRetryContext | None) -> ChatMessage: ...
 
 
 Validator = Callable[[ModelT], None]
 
 
-def _messages_with_response_schema(
-    messages: tuple[ChatMessage, ChatMessage], schema_text: str
-) -> tuple[ChatMessage, ChatMessage]:
-    """Return fresh messages with the exact response schema appended to the system prompt."""
-    system_message, user_message = messages
-    return (
-        ChatMessage(
-            role="system",
-            content=f"{system_message.content}\n\nResponse JSON Schema:\n{schema_text}",
-        ),
-        user_message,
-    )
+@dataclass(slots=True)
+class _Conversation:
+    """Accepted turns for one target in one invocation, never shared across jobs."""
 
+    history: list[ChatMessage] = field(default_factory=list)
 
-def _verification_messages_for(
-    request: LLMVerificationRequest,
-    format_retry: FormatRetryContext | None,
-) -> tuple[ChatMessage, ChatMessage]:
-    return verification_messages(request, format_retry=format_retry)
+    def messages(
+        self, message: ChatMessage, response_schema: JSONSchema
+    ) -> tuple[ChatMessage, ...]:
+        instructions, _, _ = message.content.partition(REQUEST_PAYLOAD_SEPARATOR)
+        payload = payload_from_message(message.content)
+        payload["response_schema"] = response_schema
+        turn = ChatMessage(
+            role="user",
+            content=instructions
+            + REQUEST_PAYLOAD_SEPARATOR
+            + json.dumps(payload, ensure_ascii=False),
+        )
+        return (*self.history, turn)
+
+    def accept(self, messages: tuple[ChatMessage, ...], output: BaseModel) -> None:
+        self.history = [
+            *messages,
+            ChatMessage(role="assistant", content=output.model_dump_json()),
+        ]
 
 
 # endregion
@@ -362,10 +369,11 @@ class RuleGenerator:
         self,
         *,
         phase: CallPhase,
-        output_model: type[ModelT] | TypeAdapter[ModelT],
+        output_model: TypeAdapter[ModelT],
         output_name: str,
         response_schema: JSONSchema,
-        messages_factory: MessagesFactory,
+        conversation: _Conversation,
+        build_message: MessageBuilder,
         validator: Validator[ModelT],
         max_format_retries: int,
         budget: _Budget,
@@ -373,10 +381,9 @@ class RuleGenerator:
     ) -> ModelT:
         """Call the LLM and validate its typed response within the format-retry budget."""
         format_retry: FormatRetryContext | None = None
-        schema_text = json.dumps(response_schema, indent=2, ensure_ascii=False)
         for attempt in range(max_format_retries + 1):
-            messages = _messages_with_response_schema(
-                messages_factory(format_retry=format_retry), schema_text
+            messages = conversation.messages(
+                build_message(format_retry=format_retry), response_schema
             )
             budget.begin_call()
             _LOGGER.info(
@@ -437,15 +444,16 @@ class RuleGenerator:
                 )
                 if attempt >= max_format_retries:
                     raise _ProviderCallFailure("truncated_response")
+                format_retry = FormatRetryContext(
+                    kind="shape", error_codes=("truncated_response",), field_paths=()
+                )
                 continue
             if not isinstance(raw_payload, str):
                 raise _ProviderCallFailure("invalid_response")
             try:
-                if isinstance(output_model, TypeAdapter):
-                    parsed = output_model.validate_json(raw_payload)
-                else:
-                    parsed = output_model.model_validate_json(raw_payload)
+                parsed = output_model.validate_json(raw_payload)
                 validator(parsed)
+                conversation.accept(messages, parsed)
                 _LOGGER.info(
                     "rulegen LLM response validated: phase=%s format_attempt=%d",
                     phase,
@@ -499,6 +507,7 @@ class RuleGenerator:
         )
 
         validation_failures: list[LLMOutputValidationFailure] = []
+        conversation = _Conversation()
         regeneration: RegenerationContext | None = None
         latest_candidate: QuestionRule | None = None
 
@@ -508,12 +517,13 @@ class RuleGenerator:
                     "rulegen synthesis attempt started: regeneration_attempt=%d",
                     regeneration_attempt,
                 )
-                synthesis_result: SynthesisResult = await self._call_typed(
+                synthesis_response: SynthesisResponse = await self._call_typed(
                     phase="synthesis",
-                    output_model=TypeAdapter(SynthesisResult),
-                    output_name="SynthesisResult",
+                    conversation=conversation,
+                    output_model=TypeAdapter(SynthesisResponse),
+                    output_name="SynthesisResponse",
                     response_schema=synthesis_response_schema(request.llm_request),
-                    messages_factory=partial(
+                    build_message=partial(
                         generation_messages,
                         request.llm_request,
                         regeneration=regeneration,
@@ -528,11 +538,11 @@ class RuleGenerator:
                 )
 
                 # The LLM could not produce a safe rule from the available information.
-                if isinstance(synthesis_result, NoSafeCandidate):
+                if isinstance(synthesis_response, NoSafeCandidate):
                     _LOGGER.info(
                         "rulegen synthesis produced no candidate",
                     )
-                    if synthesis_result.teacher_actions:
+                    if synthesis_response.result.teacher_actions:
                         return RuleGenerationResult(
                             status="needs_teacher_action",
                             teacher_action_request=TeacherActionRequest(
@@ -543,15 +553,15 @@ class RuleGenerator:
                                         ],
                                         prompt=action,
                                     )
-                                    for action in synthesis_result.teacher_actions
+                                    for action in synthesis_response.result.teacher_actions
                                 ]
                             ),
-                            reason=synthesis_result.reason_code,
+                            reason=synthesis_response.result.reason_code,
                             validation_failures=tuple(validation_failures),
                         )
                     return RuleGenerationResult(
                         status="no_safe_candidate",
-                        reason=synthesis_result.reason_code,
+                        reason=synthesis_response.result.reason_code,
                         validation_failures=tuple(validation_failures),
                     )
 
@@ -559,7 +569,7 @@ class RuleGenerator:
 
                 # COMPILATION AND EXECUTION
                 try:
-                    candidate = cast(QuestionRule, synthesis_result._engine_rule)
+                    candidate = cast(QuestionRule, synthesis_response._engine_rule)
                     latest_candidate = candidate
                     _LOGGER.info(
                         "rulegen candidate hydrated",
@@ -591,7 +601,7 @@ class RuleGenerator:
 
                     regeneration = self._candidate_execution_regeneration(
                         latest_candidate,
-                        synthesis_result.behavioral_contract,
+                        synthesis_response.result.model_case_expectations,
                         exc,
                         context=generation_context(request.llm_request),
                     )
@@ -609,7 +619,7 @@ class RuleGenerator:
                         )
                     regeneration = self._candidate_validation_regeneration(
                         candidate,
-                        synthesis_result.behavioral_contract,
+                        synthesis_response.result.model_case_expectations,
                         context=generation_context(request.llm_request),
                     )
                     continue
@@ -619,16 +629,16 @@ class RuleGenerator:
                     request,
                     candidate,
                     execution,
-                    synthesis_result.behavioral_contract,
+                    synthesis_response.result.model_case_expectations,
                 )
                 if (
-                    verification_request.mismatch_test_result_ids
-                    or verification_request.contract_mismatch_test_result_ids
+                    verification_request.teacher_label_mismatch_test_result_ids
+                    or verification_request.model_expectation_mismatch_test_result_ids
                 ):
                     _LOGGER.info(
                         "rulegen local mismatches requested regeneration: mismatches=%d",
-                        len(verification_request.mismatch_test_result_ids)
-                        + len(verification_request.contract_mismatch_test_result_ids),
+                        len(verification_request.teacher_label_mismatch_test_result_ids)
+                        + len(verification_request.model_expectation_mismatch_test_result_ids),
                     )
                     if regeneration_attempt >= request.limits.max_regeneration_attempts:
                         return RuleGenerationResult(
@@ -639,18 +649,19 @@ class RuleGenerator:
                     regeneration = self._local_mismatch_regeneration(
                         verification_request,
                         candidate,
-                        synthesis_result.behavioral_contract,
+                        synthesis_response.result.model_case_expectations,
                         context=generation_context(request.llm_request),
                     )
                     continue
 
                 verification = await self._call_typed(
                     phase="verification",
+                    conversation=conversation,
                     output_model=TypeAdapter(VerificationResult),
                     output_name="VerificationResult",
                     response_schema=verification_response_schema(),
-                    messages_factory=partial(
-                        _verification_messages_for,
+                    build_message=partial(
+                        verification_messages,
                         verification_request,
                     ),
                     validator=partial(
@@ -681,7 +692,7 @@ class RuleGenerator:
                     )
                 regeneration = RegenerationContext(
                     rule=authoring_payload(candidate, generation_context(request.llm_request)),
-                    behavioral_contract=synthesis_result.behavioral_contract,
+                    model_case_expectations=synthesis_response.result.model_case_expectations,
                     failure=RegenerationFailure(
                         kind="behavioral_mismatch",
                         reason_codes=[str(code) for code in verification.failure_reason_codes],
@@ -719,16 +730,18 @@ class RuleGenerator:
             max_total_tokens=request.limits.max_total_tokens,
         )
         failures: list[LLMOutputValidationFailure] = []
+        conversation = _Conversation()
         regeneration: RegenerationContext | None = None
         latest_candidate: QuestionRule | None = None
         try:
             for regeneration_attempt in range(request.limits.max_regeneration_attempts + 1):
-                synthesis_result: SynthesisResult = await self._call_typed(
+                synthesis_response: SynthesisResponse = await self._call_typed(
                     phase="synthesis",
-                    output_model=TypeAdapter(SynthesisResult),
-                    output_name="SynthesisResult",
+                    conversation=conversation,
+                    output_model=TypeAdapter(SynthesisResponse),
+                    output_name="SynthesisResponse",
                     response_schema=group_synthesis_response_schema(request.llm_request),
-                    messages_factory=partial(
+                    build_message=partial(
                         group_generation_messages,
                         request.llm_request,
                         regeneration=regeneration,
@@ -744,8 +757,8 @@ class RuleGenerator:
                     budget=budget,
                     validation_failures=failures,
                 )
-                if isinstance(synthesis_result, NoSafeCandidate):
-                    if synthesis_result.teacher_actions:
+                if isinstance(synthesis_response, NoSafeCandidate):
+                    if synthesis_response.result.teacher_actions:
                         return RuleGenerationResult(
                             status="needs_teacher_action",
                             teacher_action_request=TeacherActionRequest(
@@ -754,20 +767,20 @@ class RuleGenerator:
                                         target_question_ids=list(request.llm_request.question_ids),
                                         prompt=action,
                                     )
-                                    for action in synthesis_result.teacher_actions
+                                    for action in synthesis_response.result.teacher_actions
                                 ]
                             ),
-                            reason=synthesis_result.reason_code,
+                            reason=synthesis_response.result.reason_code,
                             validation_failures=tuple(failures),
                         )
                     return RuleGenerationResult(
                         status="no_safe_candidate",
-                        reason=synthesis_result.reason_code,
+                        reason=synthesis_response.result.reason_code,
                         validation_failures=tuple(failures),
                     )
                 latest_candidate = None
                 try:
-                    candidate = cast(QuestionRule, synthesis_result._engine_rule)
+                    candidate = cast(QuestionRule, synthesis_response._engine_rule)
                     latest_candidate = candidate
                     execution = execute_candidate_rule(
                         candidate,
@@ -784,7 +797,7 @@ class RuleGenerator:
                         )
                     regeneration = self._candidate_execution_regeneration(
                         latest_candidate,
-                        synthesis_result.behavioral_contract,
+                        synthesis_response.result.model_case_expectations,
                         exc,
                         context=generation_context(request.llm_request),
                     )
@@ -798,7 +811,7 @@ class RuleGenerator:
                         )
                     regeneration = self._candidate_validation_regeneration(
                         candidate,
-                        synthesis_result.behavioral_contract,
+                        synthesis_response.result.model_case_expectations,
                         context=generation_context(request.llm_request),
                     )
                     continue
@@ -807,11 +820,11 @@ class RuleGenerator:
                     request,
                     candidate,
                     execution,
-                    synthesis_result.behavioral_contract,
+                    synthesis_response.result.model_case_expectations,
                 )
                 if (
-                    verification_request.mismatch_test_result_ids
-                    or verification_request.contract_mismatch_test_result_ids
+                    verification_request.teacher_label_mismatch_test_result_ids
+                    or verification_request.model_expectation_mismatch_test_result_ids
                 ):
                     if regeneration_attempt >= request.limits.max_regeneration_attempts:
                         return RuleGenerationResult(
@@ -822,16 +835,17 @@ class RuleGenerator:
                     regeneration = self._local_mismatch_regeneration(
                         verification_request,
                         candidate,
-                        synthesis_result.behavioral_contract,
+                        synthesis_response.result.model_case_expectations,
                         context=generation_context(request.llm_request),
                     )
                     continue
                 latest_verification = await self._call_typed(
                     phase="verification",
+                    conversation=conversation,
                     output_model=TypeAdapter(VerificationResult),
                     output_name="VerificationResult",
                     response_schema=verification_response_schema(),
-                    messages_factory=partial(_verification_messages_for, verification_request),
+                    build_message=partial(verification_messages, verification_request),
                     validator=partial(_validate_verification_catalog, request=verification_request),
                     max_format_retries=request.limits.max_format_retries,
                     budget=budget,
@@ -850,7 +864,7 @@ class RuleGenerator:
                     )
                 regeneration = RegenerationContext(
                     rule=authoring_payload(candidate, generation_context(request.llm_request)),
-                    behavioral_contract=synthesis_result.behavioral_contract,
+                    model_case_expectations=synthesis_response.result.model_case_expectations,
                     failure=RegenerationFailure(
                         kind="behavioral_mismatch",
                         reason_codes=[
@@ -885,15 +899,15 @@ class RuleGenerator:
         request: _PreparedQuestionJob,
         candidate: QuestionRule,
         execution: CandidateExecutionResult,
-        behavioral_contract: BehavioralContract,
+        model_case_expectations: list[ModelCaseExpectation],
     ) -> LLMVerificationRequest:
         target = request.llm_request.question.question_id
         results: list[VerificationTestResult] = []
         mismatches: list[str] = []
-        contract_mismatches: list[str] = []
-        contract_points = {
+        expectation_mismatches: list[str] = []
+        expectation_points = {
             expectation.source_id: expectation.expected_points
-            for expectation in behavioral_contract.case_expectations
+            for expectation in model_case_expectations
         }
         for case in request.cases:
             result = execution.results_by_case_id[case.case_id][target]
@@ -911,11 +925,11 @@ class RuleGenerator:
                 mismatches.append(case.case_id)
             if not math.isclose(
                 result.points,
-                contract_points[case.case_id],
+                expectation_points[case.case_id],
                 rel_tol=0.0,
                 abs_tol=1e-9,
             ):
-                contract_mismatches.append(case.case_id)
+                expectation_mismatches.append(case.case_id)
             results.append(
                 VerificationTestResult(
                     test_result_id=case.case_id,
@@ -930,11 +944,11 @@ class RuleGenerator:
         return LLMVerificationRequest(
             teacher_intent=request.llm_request.teacher_intent,
             questions=[request.llm_request.question],
-            behavioral_contract=behavioral_contract,
+            model_case_expectations=model_case_expectations,
             rule=authoring_payload(candidate, generation_context(request.llm_request)),
             test_results=results,
-            mismatch_test_result_ids=mismatches,
-            contract_mismatch_test_result_ids=contract_mismatches,
+            teacher_label_mismatch_test_result_ids=mismatches[:MAX_TEST_RESULT_IDS],
+            model_expectation_mismatch_test_result_ids=expectation_mismatches[:MAX_TEST_RESULT_IDS],
         )
 
     @staticmethod
@@ -942,15 +956,15 @@ class RuleGenerator:
         request: _PreparedGroupJob,
         candidate: QuestionRule,
         execution: CandidateExecutionResult,
-        behavioral_contract: BehavioralContract,
+        model_case_expectations: list[ModelCaseExpectation],
     ) -> LLMVerificationRequest:
         question_ids = request.llm_request.question_ids
         results: list[VerificationTestResult] = []
         mismatches: list[str] = []
-        contract_mismatches: list[str] = []
-        contract_points = {
+        expectation_mismatches: list[str] = []
+        expectation_points = {
             expectation.source_id: expectation.expected_points
-            for expectation in behavioral_contract.case_expectations
+            for expectation in model_case_expectations
         }
         for case in request.cases:
             case_results = execution.results_by_case_id[case.case_id]
@@ -968,8 +982,10 @@ class RuleGenerator:
                 actual, expected, rel_tol=0.0, abs_tol=1e-9
             ):
                 mismatches.append(case.case_id)
-            if not math.isclose(actual, contract_points[case.case_id], rel_tol=0.0, abs_tol=1e-9):
-                contract_mismatches.append(case.case_id)
+            if not math.isclose(
+                actual, expectation_points[case.case_id], rel_tol=0.0, abs_tol=1e-9
+            ):
+                expectation_mismatches.append(case.case_id)
             results.append(
                 VerificationTestResult(
                     test_result_id=case.case_id,
@@ -991,16 +1007,16 @@ class RuleGenerator:
             teacher_intent=request.llm_request.teacher_intent,
             questions=request.llm_request.questions,
             rule=authoring_payload(candidate, generation_context(request.llm_request)),
-            behavioral_contract=behavioral_contract,
+            model_case_expectations=model_case_expectations,
             test_results=results,
-            mismatch_test_result_ids=mismatches,
-            contract_mismatch_test_result_ids=contract_mismatches,
+            teacher_label_mismatch_test_result_ids=mismatches[:MAX_TEST_RESULT_IDS],
+            model_expectation_mismatch_test_result_ids=expectation_mismatches[:MAX_TEST_RESULT_IDS],
         )
 
     @staticmethod
     def _candidate_execution_regeneration(
         candidate: QuestionRule | None,
-        behavioral_contract: BehavioralContract,
+        model_case_expectations: list[ModelCaseExpectation],
         error: BaseException,
         *,
         context: RuleContext,
@@ -1020,7 +1036,7 @@ class RuleGenerator:
             )
         return RegenerationContext(
             rule=authoring_payload(candidate, context) if candidate is not None else {},
-            behavioral_contract=behavioral_contract,
+            model_case_expectations=model_case_expectations,
             failure=RegenerationFailure(
                 kind="execution",
                 reason_codes=[reason_code],
@@ -1031,14 +1047,14 @@ class RuleGenerator:
     @staticmethod
     def _candidate_validation_regeneration(
         candidate: QuestionRule,
-        behavioral_contract: BehavioralContract,
+        model_case_expectations: list[ModelCaseExpectation],
         *,
         context: RuleContext,
     ) -> RegenerationContext:
         """Build sanitized feedback for a candidate rejected by rubric validation."""
         return RegenerationContext(
             rule=authoring_payload(candidate, context),
-            behavioral_contract=behavioral_contract,
+            model_case_expectations=model_case_expectations,
             failure=RegenerationFailure(
                 kind="validation",
                 reason_codes=["candidate_validation_failed"],
@@ -1054,39 +1070,41 @@ class RuleGenerator:
     def _local_mismatch_regeneration(
         verification_request: LLMVerificationRequest,
         candidate: QuestionRule,
-        behavioral_contract: BehavioralContract,
+        model_case_expectations: list[ModelCaseExpectation],
         *,
         context: RuleContext,
     ) -> RegenerationContext:
         mismatch_ids = list(
             dict.fromkeys(
                 [
-                    *verification_request.mismatch_test_result_ids,
-                    *verification_request.contract_mismatch_test_result_ids,
+                    *verification_request.teacher_label_mismatch_test_result_ids,
+                    *verification_request.model_expectation_mismatch_test_result_ids,
                 ]
             )
         )
         codes: list[VerificationFailureReason] = []
-        if verification_request.mismatch_test_result_ids:
-            codes.append("expected_outcome_mismatch")
-        if verification_request.contract_mismatch_test_result_ids:
-            codes.append("partial_credit_mismatch")
+        if verification_request.teacher_label_mismatch_test_result_ids:
+            codes.append("teacher_label_mismatch")
+        if verification_request.model_expectation_mismatch_test_result_ids:
+            codes.append("model_expectation_mismatch")
         return RegenerationContext(
             rule=authoring_payload(candidate, context),
-            behavioral_contract=behavioral_contract,
+            model_case_expectations=model_case_expectations,
             failure=RegenerationFailure(
                 kind="behavioral_mismatch",
                 reason_codes=list(dict.fromkeys(codes)),
                 guidance=(
                     "Correct the deterministic rule so engine outcomes match all authoritative "
-                    "labels and every behavioral-contract expectation."
+                    "teacher-labelled scores and model case expectations. Revise representative "
+                    "case expectations only to correct them against original teacher intent, "
+                    "explaining each changed score in its reason."
                 ),
             ),
             cited_test_results=[
                 result
                 for result in verification_request.test_results
                 if result.test_result_id in mismatch_ids
-            ],
+            ][:MAX_TEST_RESULT_IDS],
         )
 
 

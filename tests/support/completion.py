@@ -16,7 +16,12 @@ import rulegen.generator as generator_module
 from rulegen.evidence import TargetEvidence, TargetLabelledCase, TargetRepresentativeCase
 from rulegen.execution import CandidateTestCase
 from rulegen.llm import ChatMessage, JSONSchema, LiteLLMConfig
-from rulegen.prompts import GENERATION_INSTRUCTIONS, VERIFICATION_INSTRUCTIONS
+from rulegen.prompts import (
+    GENERATION_INSTRUCTIONS,
+    REQUEST_PAYLOAD_SEPARATOR,
+    VERIFICATION_INSTRUCTIONS,
+    payload_from_message,
+)
 from rulegen.requests import GenerationLimits, GenerationRequest
 from rulegen.targets import Target, TargetTask
 
@@ -114,23 +119,19 @@ class ScriptedCompletion:
         )
 
 
-def _behavioral_contract(
+def _model_case_expectations(
     expectations: list[tuple[str, int | float]] | None = None,
-) -> dict[str, Any]:
-    return {
-        "interpretation": "Apply the deterministic rule behavior described by the strategy.",
-        "boundary_behaviors": [],
-        "case_expectations": [
-            {
-                "source_id": source_id,
-                "expected_points": expected_points,
-                "reason": "This is the intended outcome for this supplied case.",
-            }
-            for source_id, expected_points in (
-                expectations if expectations is not None else [("positive", 1), ("negative", 0)]
-            )
-        ],
-    }
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "source_id": source_id,
+            "expected_points": expected_points,
+            "reason": "This is the intended outcome for this supplied case.",
+        }
+        for source_id, expected_points in (
+            expectations if expectations is not None else [("positive", 1), ("negative", 0)]
+        )
+    ]
 
 
 def _synthesis(
@@ -138,18 +139,22 @@ def _synthesis(
 ) -> dict[str, Any]:
     return {
         "outcome": "candidate",
-        "summary": "Accept the supported exact answer.",
-        "rule": {"type": "TEXT_MATCH", "answers": answers},
-        "behavioral_contract": _behavioral_contract(expectations),
+        "result": {
+            "summary": "Accept the supported exact answer.",
+            "rule": {"type": "TEXT_MATCH", "answers": answers},
+            "model_case_expectations": _model_case_expectations(expectations),
+        },
     }
 
 
 def _strategy_synthesis(strategy: dict[str, Any]) -> dict[str, Any]:
     return {
         "outcome": "candidate",
-        "summary": "Use the deterministic strategy supported by the examples.",
-        "rule": strategy,
-        "behavioral_contract": _behavioral_contract([("positive", 2), ("negative", 0)]),
+        "result": {
+            "summary": "Use the deterministic strategy supported by the examples.",
+            "rule": strategy,
+            "model_case_expectations": _model_case_expectations([("positive", 2), ("negative", 0)]),
+        },
     }
 
 
@@ -165,15 +170,22 @@ def _assert_request_schema_is_visible(request: dict[str, Any]) -> dict[str, Any]
     response_format = request["response_format"]
     json_schema = response_format["json_schema"]
     schema = json_schema["schema"]
-    system_message = request["messages"][0]
-    assert system_message["role"] == "system"
-    instructions, separator, schema_text = system_message["content"].partition(
-        "\n\nResponse JSON Schema:\n"
-    )
-    assert separator
-    assert system_message["content"].count("Response JSON Schema:") == 1
-    assert instructions in {GENERATION_INSTRUCTIONS, VERIFICATION_INSTRUCTIONS}
-    assert json.loads(schema_text) == schema
+    messages = request["messages"]
+    assert all(message["role"] != "system" for message in messages)
+    assert messages[0]["role"] == "user"
+    for message in messages:
+        if message["role"] == "user":
+            payload = payload_from_message(message["content"])
+            assert payload["phase"] in {"generation", "verification", "regeneration"}
+            instructions = (
+                VERIFICATION_INSTRUCTIONS
+                if payload["phase"] == "verification"
+                else GENERATION_INSTRUCTIONS
+            )
+            assert message["content"].partition(REQUEST_PAYLOAD_SEPARATOR)[0] == instructions
+    user_payload = payload_from_message(messages[-1]["content"])
+    assert user_payload["response_schema"] == schema
+    assert user_payload["phase"] in {"generation", "verification", "regeneration"}
     assert response_format == {
         "type": "json_schema",
         "json_schema": {"name": json_schema["name"], "strict": True, "schema": schema},

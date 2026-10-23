@@ -19,7 +19,7 @@
 
 ### FR2. Rule proposal generation
 
-- `rulegen` shall generate one or more structured rule proposals for each selected target using the configured LLM provider.
+- `rulegen` shall generate one evolving structured rule candidate for each selected target using the configured LLM provider.
 - `rulegen` shall support only compatible, registered generation families. Length, Bonus, Composite, single-question Assumption Set, and Multi Valued are supported alongside the existing families. Every nested value rule must be compatible with its trusted question or component slot. Code, code tests, regex, similarity, and transformer generation remain excluded recursively.
 - (Tentative) The system shall return structured statuses such as `needs_context`, `needs_clarification`, `no_safe_candidate`, `verified`, and `unresolved`.
 - A grouped global rule shall apply only to the explicitly selected group and shall evaluate the group questions together.
@@ -41,7 +41,11 @@
   - **LLM-selected examples:** submissions selected by the LLM as likely marking edge cases or otherwise high-value cases that require thorough testing against the candidate.
 - `rulegen` shall call the engine to execute each candidate against every submission in the representative sample and shall record the source of each selected submission.
 - The system shall provide observed scores, feedback, mismatches, coverage, and representative-sample composition as proposal evidence.
-- The LLM shall verify the candidate against the LLM's inferred teacher’s intent and observed engine behaviour.
+- The LLM shall verify the normalized rule, including engine defaults, and observed engine behaviour against the original teacher request. Candidate summaries and case reasons shall not replace teacher intent.
+- Candidates shall contain direct model case expectations with exactly one source ID, bounded expected score, and reason for every supplied case. Teacher-labelled scores remain authoritative; representative scores may change only to correct an earlier prediction against teacher intent.
+- Each target invocation shall use one continuing in-memory conversation across generation, verification, regeneration, and format retries, retaining accepted turns, validated assistant JSON, and verdicts without summarizing or silently truncating original input. Targets, concurrent calls, and later requests shall be isolated.
+- Deterministic failures shall go directly to regeneration; otherwise verification shall explicitly return `verified` or `regenerate`. Every regenerated candidate shall execute and pass verification again.
+- Invalid or truncated replies shall be excluded from retained history. Format retries shall replay preceding accepted history with bounded diagnostics. All calls and replayed history consume existing per-target budgets.
 - Failed validation or verification may trigger bounded retry or regeneration.
 - `rulegen` shall stop when its retry or resource budget is reached. Only candidates that completed behavioral verification may be returned as applyable proposals; exhausted attempts return diagnostics without authorizing application.
 
@@ -118,7 +122,7 @@
 - All provider responses shall pass RuleGen's strict local response-envelope validation, engine model validation, and semantic/contextual validation. Provider-facing JSON Schemas shall use keywords supported by the configured structured-output providers. `validate_rule()` shall retain checks for duplicates, numeric bounds, compatibility, and constraints omitted from the provider schema. Refusals, truncation, and provider failures shall remain handled by the bounded generation workflow.
 - Backend, `rulegen`, and engine responsibilities shall remain separated:
   - Backend: authorization, persistence, configuration, and transactions.
-  - `rulegen`: proposal generation, validation, testing, verification, and ranking.
+  - `rulegen`: candidate generation, validation, testing, verification, and bounded regeneration.
   - Engine: rule semantics, validation, execution, and grading.
 
 ### NFR7. Testing and deployment

@@ -8,7 +8,7 @@ from pydantic import TypeAdapter
 from .authoring import AuthoringSchema, provider_schema
 from .llm import JSONSchema
 from .llm_payloads import LLMGenerationRequest, LLMGroupGenerationRequest
-from .models import SynthesisResult, VerificationResult
+from .models import SynthesisResponse, VerificationResult
 from .validation import generation_context
 
 
@@ -21,8 +21,8 @@ def group_synthesis_response_schema(request: LLMGroupGenerationRequest) -> JSONS
 
 
 def _synthesis_schema(context: RuleContext, allowed: list[str]) -> JSONSchema:
-    schema = TypeAdapter(SynthesisResult).json_schema(mode="validation")
-    candidate = schema["$defs"]["SynthesisCandidate"]["properties"]
+    schema = TypeAdapter(SynthesisResponse).json_schema(mode="validation")
+    candidate = schema["$defs"]["SynthesisCandidatePayload"]["properties"]
     candidate["rule"] = AuthoringSchema(schema["$defs"]).union(context, allowed=allowed)
     return provider_schema(schema)
 

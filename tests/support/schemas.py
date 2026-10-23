@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from rulegen import LLMGenerationRequest, LLMQuestion, LLMRepresentativeStudentAnswer
+from rulegen import LLMGenerationRequest, LLMQuestion, LLMRepresentativeCase
 
 # Response schemas
 
@@ -19,8 +19,8 @@ def generation_request(allowed_rule_kinds, *, choice_options=None):
             question_id="q1", type=kind, max_points=1, choice_options=choice_options or {}
         ),
         teacher_intent="Apply the stated grading policy.",
-        representative_student_answers=[
-            LLMRepresentativeStudentAnswer(source_id="case-1", answers={"q1": "answer"}, count=1)
+        representative_cases=[
+            LLMRepresentativeCase(source_id="case-1", answers={"q1": "answer"}, count=1)
         ],
     )
 
@@ -30,7 +30,7 @@ def resolve(schema, ref):
 
 
 def root(schema):
-    return schema["$defs"]["SynthesisCandidate"]["properties"]["rule"]
+    return schema["$defs"]["SynthesisCandidatePayload"]["properties"]["rule"]
 
 
 def definition(schema, union, kind):

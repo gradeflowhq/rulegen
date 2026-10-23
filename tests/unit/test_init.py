@@ -16,8 +16,8 @@ def test_package_root_exports_stable_authoring_contract() -> None:
         "Target",
         "TargetTask",
         "SynthesisCandidate",
-        "SynthesisResult",
-        "LLMTeacherLabelledExample",
+        "SynthesisResponse",
+        "LLMTeacherCaseExpectation",
         "LLMGenerationRequest",
         "LLMQuestion",
         "LLMAnswerMap",
@@ -26,7 +26,7 @@ def test_package_root_exports_stable_authoring_contract() -> None:
         "build_llm_generation_payload",
         "llm_answer",
         "LLMOutputValidationFailure",
-        "LLMRepresentativeStudentAnswer",
+        "LLMRepresentativeCase",
         "RuleGenerationResult",
         "RuleGenerator",
         "LiteLLMConfig",
@@ -42,3 +42,5 @@ def test_package_root_exports_stable_authoring_contract() -> None:
 
     assert expected_exports.issubset(rulegen.__all__)
     assert all(hasattr(rulegen, name) for name in expected_exports)
+    assert "BehavioralContract" not in rulegen.__all__
+    assert not hasattr(rulegen, "BehavioralContract")

@@ -28,6 +28,7 @@ from rulegen.generator import RuleGenerator
 from rulegen.llm import ChatMessage, LiteLLMConfig
 from rulegen.models import SynthesisCandidate
 from rulegen.preflight import GenerationPreflightError
+from rulegen.prompts import payload_from_message
 from rulegen.registry import RuleKind
 from rulegen.requests import GenerationLimits, GenerationRequest
 from rulegen.response_schemas import synthesis_response_schema
@@ -40,16 +41,17 @@ from tests.support.completion import (
     ScriptedResponse,
     TruncatedOutput,
     _assert_request_schema_is_visible,
-    _behavioral_contract,
     _candidate_payload,
     _choice_request,
     _comments_only_request,
+    _model_case_expectations,
     _request,
     _request_with_unlabelled_representative,
     _strategy_synthesis,
     _synthesis,
     _verified,
 )
+from tests.support.requests import group_request, group_strategy, mixed_request
 
 
 def test_shared_calls_expose_the_exact_request_scoped_schema() -> None:
@@ -90,7 +92,7 @@ def test_format_retry_reuses_schema_once_without_mutating_reusable_messages(
     request = _request()
     prepared_job = generator_module._prepare_jobs(request)[0][1]
     reusable_messages = generator_module.generation_messages(prepared_job.llm_request)
-    original_messages = tuple(reusable_messages)
+    original_messages = reusable_messages
     monkeypatch.setattr(
         generator_module, "generation_messages", lambda *_args, **_kwargs: reusable_messages
     )
@@ -99,9 +101,11 @@ def test_format_retry_reuses_schema_once_without_mutating_reusable_messages(
             {"bad": True},
             {
                 "outcome": "no_safe_candidate",
-                "reason_code": "insufficient_evidence",
-                "explanation": "No candidate can be established from the evidence.",
-                "teacher_actions": [],
+                "result": {
+                    "reason_code": "insufficient_evidence",
+                    "explanation": "No candidate can be established from the evidence.",
+                    "teacher_actions": [],
+                },
             },
         ]
     )
@@ -124,17 +128,22 @@ def test_provider_mocked_flow_hydrates_executes_and_verifies_without_mutation() 
     assert result.candidate is not None
     assert isinstance(result.candidate, TextMatchQuestionRule)
     assert request.cases == original_cases
-    synthesis_payload = json.loads(client.calls[0][0][-1].content)
-    assert synthesis_payload["teacher_labelled_examples"] == []
-    assert "expected_points" not in client.calls[0][0][-1].content
-    verification_payload = json.loads(client.calls[1][0][-1].content)
-    assert verification_payload["behavioral_contract"] == _behavioral_contract()
+    assert [len(messages) for messages, _ in client.calls] == [1, 3]
+    assert [[message.role for message in messages] for messages, _ in client.calls] == [
+        ["user"],
+        ["user", "assistant", "user"],
+    ]
+    synthesis_payload = payload_from_message(client.calls[0][0][-1].content)
+    assert synthesis_payload["teacher_case_expectations"] == []
+    assert all("expected_points" not in case for case in synthesis_payload["representative_cases"])
+    verification_payload = payload_from_message(client.calls[1][0][-1].content)
+    assert verification_payload["model_case_expectations"] == _model_case_expectations()
     assert [item["expected_points"] for item in verification_payload["test_results"]] == [
         None,
         None,
     ]
-    assert verification_payload["contract_mismatch_test_result_ids"] == []
-    assert verification_payload["mismatch_test_result_ids"] == []
+    assert verification_payload["model_expectation_mismatch_test_result_ids"] == []
+    assert verification_payload["teacher_label_mismatch_test_result_ids"] == []
     assert verification_payload["teacher_intent"] == "Accept Paris exactly."
     assert verification_payload["rule"] == {"type": "TEXT_MATCH", "answers": ["Paris"]}
     assert "TeacherAction" not in json.dumps(client.response_schemas[1])
@@ -232,7 +241,7 @@ def test_remaining_phase1_families_hydrate_execute_and_verify(
         "synthesis",
         "verification",
     ]
-    verification_payload = json.loads(client.calls[1][0][-1].content)
+    verification_payload = payload_from_message(client.calls[1][0][-1].content)
     assert all(
         test_result["expected_points"] is None
         for test_result in verification_payload["test_results"]
@@ -254,10 +263,12 @@ def test_remaining_phase1_families_hydrate_execute_and_verify(
     } - {strategy_definition}:
         assert disabled_definition not in schema_text
     if rule_kind == "multiple_choice":
-        synthesis_payload = json.loads(client.calls[0][0][-1].content)
+        synthesis_payload = payload_from_message(client.calls[0][0][-1].content)
         assert synthesis_payload["question"]["choice_options"]["d"] == "Utility-based agent"
-        assert synthesis_payload["teacher_labelled_examples"] == []
-        assert "expected_points" not in client.calls[0][0][-1].content
+        assert synthesis_payload["teacher_case_expectations"] == []
+        assert all(
+            "expected_points" not in case for case in synthesis_payload["representative_cases"]
+        )
         assert "accepted_choices" not in client.calls[0][0][-1].content
         assert all(f'"{choice_id}"' in schema_text for choice_id in ("a", "b", "c", "d"))
 
@@ -283,9 +294,10 @@ def test_unknown_generated_choice_id_uses_catalog_retry() -> None:
     result = asyncio.run(RuleGenerator(TEST_LITELLM_CONFIG).generate(request))
     assert result.status == "verified"
     assert len(client.calls) == 3
-    retry_payload = json.loads(client.calls[1][0][-1].content)
+    retry_payload = payload_from_message(client.calls[1][0][-1].content)
     assert retry_payload["format_retry"]["reason"] == "local_shape_or_catalog_validation_failed"
     assert retry_payload["format_retry"]["error_codes"] == ["unknown_choice_id"]
+    assert retry_payload["format_retry"]["field_paths"] == ["result.rule"]
 
 
 def test_duplicate_rule_values_use_catalog_retry_after_hydration(
@@ -304,19 +316,20 @@ def test_duplicate_rule_values_use_catalog_retry_after_hydration(
     result = asyncio.run(RuleGenerator(TEST_LITELLM_CONFIG).generate(_request()))
     assert result.status == "verified"
     assert len(client.calls) == 3
-    retry_payload = json.loads(client.calls[1][0][-1].content)
+    retry_payload = payload_from_message(client.calls[1][0][-1].content)
     assert retry_payload["format_retry"]["reason"] == "local_shape_or_catalog_validation_failed"
     assert retry_payload["format_retry"]["error_codes"] == ["duplicate_rule_values"]
+    assert retry_payload["format_retry"]["field_paths"] == ["result.rule"]
     assert [strategy.type for strategy in hydrated_strategies] == ["TEXT_MATCH", "TEXT_MATCH"]
 
 
-def test_shape_failure_gets_one_stateless_format_retry() -> None:
+def test_shape_failure_gets_one_format_retry() -> None:
     client = ScriptedCompletion([{"bad": True}, _synthesis(["Paris"]), _verified])
     result = asyncio.run(RuleGenerator(TEST_LITELLM_CONFIG).generate(_request()))
     assert result.status == "verified"
     assert len(client.calls) == 3
-    assert len(client.calls[1][0]) == 2
-    retry_payload = json.loads(client.calls[1][0][-1].content)
+    assert len(client.calls[1][0]) == 1
+    retry_payload = payload_from_message(client.calls[1][0][-1].content)
     assert retry_payload["format_retry"]["reason"] == "local_shape_or_catalog_validation_failed"
     for request in client.requests:
         _assert_request_schema_is_visible(request)
@@ -326,7 +339,10 @@ def test_shape_failure_gets_one_stateless_format_retry() -> None:
     "invalid_result",
     [
         {"outcome": "candidate"},
-        {"outcome": "candidate", "summary": None, "rule": None, "behavioral_contract": None},
+        {
+            "outcome": "candidate",
+            "result": {"summary": None, "rule": None, "model_case_expectations": None},
+        },
         "[]",
         {"outcome": "candidate", **_candidate_payload(), "extra": True},
         {"outcome": "candidate", **_candidate_payload(), "unexpected_field": True},
@@ -334,8 +350,7 @@ def test_shape_failure_gets_one_stateless_format_retry() -> None:
         {"outcome": "future_outcome"},
         {
             "outcome": "no_safe_candidate",
-            "reason_code": "ambiguous_intent",
-            "explanation": "Policy unresolved.",
+            "result": {"reason_code": "ambiguous_intent", "explanation": "Policy unresolved."},
         },
     ],
     ids=[
@@ -356,13 +371,15 @@ def test_invalid_result_uses_one_bounded_format_retry(invalid_result: dict[str, 
     assert result.status == "verified"
     assert result.candidate is not None
     assert len(client.requests) == 3
-    retry_payload = json.loads(client.requests[1]["messages"][-1]["content"])
+    retry_payload = payload_from_message(client.requests[1]["messages"][-1]["content"])
     assert retry_payload["format_retry"]["reason"] == "local_shape_or_catalog_validation_failed"
     schemas = [_assert_request_schema_is_visible(item) for item in client.requests]
     assert schemas[0] == schemas[1]
     for item in client.requests[:2]:
         assert item["response_format"]["json_schema"]["strict"] is True
-        assert item["messages"][0]["content"].count("Response JSON Schema:") == 1
+        assert (
+            payload_from_message(item["messages"][-1]["content"])["response_schema"] == schemas[0]
+        )
 
 
 def test_exhausted_format_retries_keep_existing_budget_accounting() -> None:
@@ -417,7 +434,7 @@ def test_demo_and_exam_all_rules_score_all_sixteen_choice_subsets(
     )
     normalized = SynthesisCandidate.model_validate(candidate)
     strategy = hydrate_single(
-        normalized.rule,
+        normalized.result.rule,
         target_question_id=question_id,
         question_type="CHOICE",
         choice_ids=options,
@@ -518,7 +535,7 @@ def test_litellm_request_configuration_response_extraction_and_retry() -> None:
     assert first_call["num_retries"] == first_call["max_retries"] == 0
     assert first_call["response_format"]["type"] == "json_schema"
     assert first_call["response_format"]["json_schema"]["strict"] is True
-    assert first_call["messages"][0]["role"] == "system"
+    assert first_call["messages"][0]["role"] == "user"
 
 
 @pytest.mark.parametrize(
@@ -530,7 +547,7 @@ def test_litellm_request_configuration_response_extraction_and_retry() -> None:
     ],
     ids=["fabricated-case-id", "duplicate-case-id", "missing-case-id"],
 )
-def test_invalid_behavioral_contract_case_ids_use_format_retry(
+def test_invalid_model_case_expectations_case_ids_use_format_retry(
     invalid_expectations: list[tuple[str, int | float]],
 ) -> None:
     client = ScriptedCompletion(
@@ -539,11 +556,11 @@ def test_invalid_behavioral_contract_case_ids_use_format_retry(
     result = asyncio.run(RuleGenerator(TEST_LITELLM_CONFIG).generate(_request()))
     assert result.status == "verified"
     assert len(client.calls) == 3
-    retry_payload = json.loads(client.calls[1][0][-1].content)
+    retry_payload = payload_from_message(client.calls[1][0][-1].content)
     assert retry_payload["format_retry"]["reason"] == "local_shape_or_catalog_validation_failed"
 
 
-def test_behavioral_contract_cannot_override_authoritative_teacher_label() -> None:
+def test_model_case_expectations_cannot_override_authoritative_teacher_label() -> None:
     client = ScriptedCompletion(
         [
             _synthesis(["Paris"], expectations=[("positive", 0), ("negative", 0)]),
@@ -554,7 +571,7 @@ def test_behavioral_contract_cannot_override_authoritative_teacher_label() -> No
     result = asyncio.run(RuleGenerator(TEST_LITELLM_CONFIG).generate(_request()))
     assert result.status == "verified"
     assert len(client.calls) == 3
-    retry_payload = json.loads(client.calls[1][0][-1].content)
+    retry_payload = payload_from_message(client.calls[1][0][-1].content)
     assert retry_payload["format_retry"]["reason"] == "local_shape_or_catalog_validation_failed"
 
 
@@ -563,9 +580,11 @@ def test_no_safe_candidate_stops_before_validation_and_verification() -> None:
         [
             {
                 "outcome": "no_safe_candidate",
-                "reason_code": "insufficient_evidence",
-                "explanation": "The examples do not establish a safe rule.",
-                "teacher_actions": [],
+                "result": {
+                    "reason_code": "insufficient_evidence",
+                    "explanation": "The examples do not establish a safe rule.",
+                    "teacher_actions": [],
+                },
             }
         ]
     )
@@ -593,9 +612,11 @@ def test_legitimate_no_safe_results_keep_existing_result_behavior(
         [
             {
                 "outcome": "no_safe_candidate",
-                "reason_code": reason_code,
-                "explanation": "The supplied policy needs a safe abstention.",
-                "teacher_actions": teacher_actions,
+                "result": {
+                    "reason_code": reason_code,
+                    "explanation": "The supplied policy needs a safe abstention.",
+                    "teacher_actions": teacher_actions,
+                },
             }
         ]
     )
@@ -633,7 +654,7 @@ def test_candidate_validation_regeneration_is_structured_and_sanitized() -> None
     assert result.status == "unresolved"
     assert result.reason == "regeneration_budget_exhausted"
     assert len(client.calls) == 2
-    regeneration = json.loads(client.calls[1][0][-1].content)["regeneration"]
+    regeneration = payload_from_message(client.calls[1][0][-1].content)["regeneration"]
     assert regeneration["failure"] == {
         "kind": "validation",
         "reason_codes": ["candidate_validation_failed"],
@@ -659,7 +680,7 @@ def test_candidate_execution_regeneration_omits_engine_error_details(monkeypatch
     result = asyncio.run(RuleGenerator(TEST_LITELLM_CONFIG).generate(request))
     assert result.status == "unresolved"
     assert result.reason == "regeneration_budget_exhausted"
-    regeneration = json.loads(client.calls[1][0][-1].content)["regeneration"]
+    regeneration = payload_from_message(client.calls[1][0][-1].content)["regeneration"]
     assert regeneration["failure"]["kind"] == "execution"
     assert regeneration["failure"]["reason_codes"] == ["candidate_execution_failed"]
     assert "No answer found" not in json.dumps(regeneration)
@@ -675,8 +696,11 @@ def test_deterministic_label_mismatch_regenerates_without_verifier() -> None:
         "synthesis",
         "verification",
     ]
-    regeneration_payload = json.loads(client.calls[1][0][-1].content)
-    assert regeneration_payload["regeneration"]["behavioral_contract"] == _behavioral_contract()
+    regeneration_payload = payload_from_message(client.calls[1][0][-1].content)
+    assert (
+        regeneration_payload["regeneration"]["model_case_expectations"]
+        == _model_case_expectations()
+    )
     hydrated = regeneration_payload["regeneration"]["rule"]
     assert hydrated["answers"] == ["Paris", "Lyon"]
     assert hydrated == {"type": "TEXT_MATCH", "answers": ["Paris", "Lyon"]}
@@ -698,13 +722,16 @@ def test_deterministic_label_mismatch_regenerates_without_verifier() -> None:
     assert "answer_map" not in json.dumps(regeneration_payload["regeneration"])
 
 
-def test_contract_mismatch_for_unlabelled_representative_regenerates_before_verifier() -> None:
+def test_expectation_mismatch_for_unlabelled_representative_regenerates_before_verifier() -> None:
     request = _request_with_unlabelled_representative()
     synthesis = _synthesis(
         ["Paris"], expectations=[("positive", 1), ("negative", 0), ("representative", 1)]
     )
     corrected = _synthesis(
         ["Paris"], expectations=[("positive", 1), ("negative", 0), ("representative", 0)]
+    )
+    corrected["result"]["model_case_expectations"][-1]["reason"] = (
+        "Correction: Marseille is not Paris, so original teacher intent requires zero points."
     )
     client = ScriptedCompletion([synthesis, corrected, _verified])
     result = asyncio.run(RuleGenerator(TEST_LITELLM_CONFIG).generate(request))
@@ -715,7 +742,7 @@ def test_contract_mismatch_for_unlabelled_representative_regenerates_before_veri
         "synthesis",
         "verification",
     ]
-    regeneration_payload = json.loads(client.calls[1][0][-1].content)["regeneration"]
+    regeneration_payload = payload_from_message(client.calls[1][0][-1].content)["regeneration"]
     assert [result["test_result_id"] for result in regeneration_payload["cited_test_results"]] == [
         "representative"
     ]
@@ -727,15 +754,17 @@ def test_synthesis_teacher_action_stops_before_validation() -> None:
         [
             {
                 "outcome": "no_safe_candidate",
-                "reason_code": "ambiguous_intent",
-                "explanation": "The partial-credit policy is ambiguous.",
-                "teacher_actions": [
-                    (
-                        "Revise the teacher intent to state whether one correct component "
-                        "earns partial credit."
-                    ),
-                    "Clarify how extra selections affect the score in the teacher intent.",
-                ],
+                "result": {
+                    "reason_code": "ambiguous_intent",
+                    "explanation": "The partial-credit policy is ambiguous.",
+                    "teacher_actions": [
+                        (
+                            "Revise the teacher intent to state whether one correct component "
+                            "earns partial credit."
+                        ),
+                        "Clarify how extra selections affect the score in the teacher intent.",
+                    ],
+                },
             }
         ]
     )
@@ -826,7 +855,7 @@ def test_intent_only_regeneration_can_cite_zero_test_results() -> None:
     )
     result = asyncio.run(RuleGenerator(TEST_LITELLM_CONFIG).generate(_comments_only_request()))
     assert result.status == "verified"
-    regeneration = json.loads(client.calls[2][0][-1].content)["regeneration"]
+    regeneration = payload_from_message(client.calls[2][0][-1].content)["regeneration"]
     assert regeneration["cited_test_results"] == []
 
 
@@ -920,7 +949,7 @@ def test_regeneration_overrides_default_numeric_configuration() -> None:
     corrected = {**initial, "config": {"approximate": False, "tolerance": 0}}
 
     def correct_default(messages):
-        regeneration = json.loads(messages[-1].content)["regeneration"]
+        regeneration = payload_from_message(messages[-1].content)["regeneration"]
         assert regeneration["rule"] == {
             **initial,
             "config": {"approximate": True, "tolerance": 1e-6},
@@ -955,6 +984,309 @@ def test_regeneration_overrides_default_numeric_configuration() -> None:
     assert isinstance(result.candidate, NumberEqualQuestionRule)
     assert result.candidate.config.approximate is False
     assert result.candidate.config.tolerance == 0
-    verification = json.loads(client.calls[2][0][-1].content)
+    verification = payload_from_message(client.calls[2][0][-1].content)
     assert verification["rule"] == corrected
     assert [item["actual_points"] for item in verification["test_results"]] == [2, 0]
+
+
+def test_synthesis_hydrates_private_engine_rule_without_changing_envelope() -> None:
+    request = _request()
+    prepared = generator_module._prepare_jobs(request)[0][1]
+    candidate = SynthesisCandidate.model_validate(_synthesis(["Paris"]))
+    serialized = candidate.model_dump_json()
+    assert candidate._engine_rule is None
+    generator_module._validate_synthesis_catalog(candidate, prepared.llm_request)
+    assert isinstance(candidate._engine_rule, TextMatchQuestionRule)
+    assert candidate.model_dump_json() == serialized
+    execution = execute_candidate_rule(candidate._engine_rule, request.question_set, request.cases)
+    assert execution.validation_errors == []
+    assert execution.results_by_case_id["positive"]["q1"].points == 1
+    assert execution.results_by_case_id["negative"]["q1"].points == 0
+
+
+def _regenerate_for_intent() -> dict[str, Any]:
+    return {
+        "outcome": "regenerate",
+        "failure_reason_codes": ["insufficient_coverage"],
+        "test_result_ids": [],
+        "correction_guidance": "Represent the original teacher policy more directly.",
+    }
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+def test_conversation_continues_through_verification_and_regeneration(
+    grouped: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = group_request() if grouped else _request()
+    candidate = (
+        {
+            "outcome": "candidate",
+            "result": {
+                "summary": "Award both correct answers.",
+                "rule": group_strategy(),
+                "model_case_expectations": _model_case_expectations([("case-1", 2)]),
+            },
+        }
+        if grouped
+        else _synthesis(["Paris"])
+    )
+    revised = deepcopy(candidate)
+    revised["result"]["summary"] = "Reconsidered against the original teacher policy."
+    verdict = _regenerate_for_intent()
+    client = ScriptedCompletion([candidate, verdict, revised, _verified])
+    original_execute = generator_module.execute_candidate_rule
+    executions = []
+
+    def track_execution(*args, **kwargs):
+        executions.append(args[0])
+        return original_execute(*args, **kwargs)
+
+    monkeypatch.setattr(generator_module, "execute_candidate_rule", track_execution)
+    generator = RuleGenerator(TEST_LITELLM_CONFIG)
+    result = asyncio.run(
+        generator.generate_group(request) if grouped else generator.generate(request)
+    )
+
+    assert result.status == "verified"
+    assert len(executions) == 2
+    assert result.candidate is executions[-1]
+    assert [len(messages) for messages, _ in client.calls] == [1, 3, 5, 7]
+    assert [
+        payload_from_message(messages[-1].content)["phase"] for messages, _ in client.calls
+    ] == [
+        "generation",
+        "verification",
+        "regeneration",
+        "verification",
+    ]
+    for index, (messages, _) in enumerate(client.calls):
+        _assert_request_schema_is_visible(client.requests[index])
+        assert [message.role for message in messages] == [
+            "user",
+            *["assistant", "user"] * index,
+        ]
+        assert payload_from_message(messages[0].content)["teacher_intent"] == request.teacher_intent
+        if index:
+            previous = client.calls[index - 1][0]
+            assert messages[: len(previous)] == previous
+    assert json.loads(client.calls[2][0][-2].content) == verdict
+    assert json.loads(client.calls[3][0][-2].content) == revised
+    assert json.loads(client.calls[3][0][3].content) == verdict
+    if grouped:
+        review = payload_from_message(client.calls[1][0][-1].content)
+        assert review["test_results"][0]["actual_points"] == 2
+        assert review["test_results"][0]["answers"] == {"q1": "a", "q2": "b"}
+        assert all(item["weight"] == 1 for item in review["rule"]["assumptions"])
+
+
+def test_verification_sees_normalized_defaults_and_original_teacher_intent() -> None:
+    request = GenerationRequest(
+        request_id="review-defaults",
+        teacher_intent="Accept exactly 2; reject every numerical difference. " + "Context. " * 1000,
+        question_set=QuestionSet(question_map={"q1": NumericQuestion(max_points=2)}),
+        cases=(
+            CandidateTestCase(case_id="positive", answer_map={"q1": 2}),
+            CandidateTestCase(case_id="negative", answer_map={"q1": 3}),
+        ),
+        tasks=(
+            TargetTask(
+                target=Target(question_ids=["q1"], allowed_rule_kinds=["number_equal"]),
+                evidence=TargetEvidence(
+                    representative_cases=[
+                        TargetRepresentativeCase(case_id="positive", count=1),
+                        TargetRepresentativeCase(case_id="negative", count=1),
+                    ]
+                ),
+            ),
+        ),
+    )
+    initial = _strategy_synthesis({"type": "NUMBER_EQUAL", "answers": [2]})
+    initial["result"]["summary"] = "An untrusted summary claiming approximation is acceptable."
+    corrected = _strategy_synthesis(
+        {
+            "type": "NUMBER_EQUAL",
+            "answers": [2],
+            "config": {"approximate": False, "tolerance": 0},
+        }
+    )
+    client = ScriptedCompletion([initial, _regenerate_for_intent(), corrected, _verified])
+    result = asyncio.run(RuleGenerator(TEST_LITELLM_CONFIG).generate(request))
+    assert result.status == "verified"
+    first_review = payload_from_message(client.calls[1][0][-1].content)
+    assert first_review["rule"]["config"] == {"approximate": True, "tolerance": 1e-6}
+    final_review = payload_from_message(client.calls[3][0][-1].content)
+    assert final_review["rule"]["config"] == {"approximate": False, "tolerance": 0}
+    for messages, _ in client.calls:
+        assert payload_from_message(messages[0].content)["teacher_intent"] == request.teacher_intent
+    assert all(item["expected_points"] is None for item in first_review["test_results"])
+
+
+@pytest.mark.parametrize("phase", ["generation", "verification", "regeneration"])
+@pytest.mark.parametrize("failure", ["shape", "catalog", "truncated"])
+def test_invalid_replies_are_excluded_from_continuing_history(phase: str, failure: str) -> None:
+    marker = "rejected-reply-marker"
+    if failure == "shape":
+        invalid: Any = '{"malformed": "' + marker
+    elif phase == "verification":
+        invalid = {**_regenerate_for_intent(), "test_result_ids": [marker]}
+    else:
+        invalid = _synthesis(["Paris", "Paris"])
+        invalid["result"]["summary"] = marker
+    if failure == "truncated":
+        invalid = TruncatedOutput(marker)
+    candidate = _synthesis(["Paris"])
+    outputs: list[Any]
+    if phase == "generation":
+        outputs = [invalid, candidate, _verified]
+        rejected_index = 0
+    elif phase == "verification":
+        outputs = [candidate, invalid, _verified]
+        rejected_index = 1
+    else:
+        outputs = [candidate, _regenerate_for_intent(), invalid, candidate, _verified]
+        rejected_index = 2
+    client = ScriptedCompletion(outputs)
+    result = asyncio.run(RuleGenerator(TEST_LITELLM_CONFIG).generate(_request()))
+    assert result.status == "verified"
+    rejected_messages = client.calls[rejected_index][0]
+    retry_messages = client.calls[rejected_index + 1][0]
+    assert retry_messages[:-1] == rejected_messages[:-1]
+    assert len(retry_messages) == len(rejected_messages)
+    assert "format_retry" in payload_from_message(retry_messages[-1].content)
+    for messages, _ in client.calls[rejected_index + 1 :]:
+        assert marker not in " ".join(message.content for message in messages)
+    assert len(client.calls[-1][0]) == (7 if phase == "regeneration" else 3)
+
+
+def test_mixed_targets_have_separate_conversations() -> None:
+    single = _synthesis(["a"], expectations=[("shared-case", 1), ("single-rep", 0)])
+    group = {
+        "outcome": "candidate",
+        "result": {
+            "summary": "Accept y and z for the explicit group.",
+            "rule": {
+                "type": "ASSUMPTION_SET_MULTI",
+                "assumptions": [
+                    {
+                        "rules": [
+                            {"type": "TEXT_MATCH", "question_id": "q2", "answers": ["y"]},
+                            {"type": "TEXT_MATCH", "question_id": "q3", "answers": ["z"]},
+                        ]
+                    }
+                ],
+            },
+            "model_case_expectations": _model_case_expectations(
+                [("group-label", 2), ("shared-case", 0)]
+            ),
+        },
+    }
+    client = ScriptedCompletion([single, _verified, group, _verified])
+    result = asyncio.run(RuleGenerator(TEST_LITELLM_CONFIG).generate_mixed(mixed_request()))
+    assert result.status == "verified"
+    assert [len(messages) for messages, _ in client.calls] == [1, 3, 1, 3]
+    group_history = client.calls[3][0]
+    assert json.loads(group_history[1].content) == group
+    assert "single-rep" not in " ".join(message.content for message in group_history)
+    observations = payload_from_message(group_history[-1].content)["test_results"]
+    assert [item["expected_points"] for item in observations] == [2, None]
+
+
+def test_concurrent_and_later_invocations_have_isolated_history(monkeypatch) -> None:
+    first = _request()
+    second_data = first.model_dump()
+    second_data["teacher_intent"] = "Accept Rome exactly."
+    second_data["cases"][0]["answer_map"]["q1"] = "Rome"
+    second = GenerationRequest.model_validate(second_data)
+    client = ScriptedCompletion([])
+    original_call = client.acompletion
+
+    async def run():
+        arrived = 0
+        both_generating = asyncio.Event()
+
+        async def interleaved_call(**kwargs):
+            nonlocal arrived
+            payload = payload_from_message(kwargs["messages"][-1]["content"])
+            intent = payload["teacher_intent"]
+            answer = "Rome" if "Rome" in intent else "Paris"
+            client.outputs.append(
+                _synthesis([answer]) if payload["phase"] == "generation" else _verified
+            )
+            response = await original_call(**kwargs)
+            if payload["phase"] == "generation":
+                arrived += 1
+                if arrived == 2:
+                    both_generating.set()
+                await both_generating.wait()
+            return response
+
+        monkeypatch.setattr(generator_module, "acompletion", interleaved_call)
+        generator = RuleGenerator(TEST_LITELLM_CONFIG)
+        results = await asyncio.gather(generator.generate(first), generator.generate(second))
+        results.append(await generator.generate(first))
+        return results
+
+    results = asyncio.run(run())
+    assert all(result.status == "verified" for result in results)
+    assert [result.candidate.answers for result in results] == [["Paris"], ["Rome"], ["Paris"]]
+    assert [len(messages) for messages, _ in client.calls] == [1, 1, 3, 3, 1, 3]
+    for messages, _ in client.calls:
+        intent = payload_from_message(messages[0].content)["teacher_intent"]
+        if len(messages) == 3:
+            assert payload_from_message(messages[-1].content)["teacher_intent"] == intent
+            answer = "Rome" if "Rome" in intent else "Paris"
+            assert json.loads(messages[1].content)["result"]["rule"]["answers"] == [answer]
+
+
+def test_replayed_history_consumes_token_budget_before_returning_a_candidate(monkeypatch) -> None:
+    client = ScriptedCompletion(
+        [_synthesis(["Paris"]), _regenerate_for_intent(), _synthesis(["Paris"]), _verified]
+    )
+    original_call = client.acompletion
+
+    async def charge_history(**kwargs):
+        client.total_tokens = 10 * len(kwargs["messages"])
+        return await original_call(**kwargs)
+
+    monkeypatch.setattr(generator_module, "acompletion", charge_history)
+    request = _request(limits=GenerationLimits(max_total_tokens=150))
+    result = asyncio.run(RuleGenerator(TEST_LITELLM_CONFIG).generate(request))
+    assert result.status == "unresolved"
+    assert result.reason == "LLM token budget exhausted"
+    assert result.candidate is None
+    assert [len(messages) for messages, _ in client.calls] == [1, 3, 5, 7]
+
+
+def test_all_cases_execute_while_regeneration_evidence_remains_bounded() -> None:
+    data = _request().model_dump()
+    data["teacher_intent"] = "Accept Rome exactly."
+    data["cases"] = tuple(
+        CandidateTestCase(case_id=f"case-{index}", answer_map={"q1": "Paris"})
+        for index in range(100)
+    )
+    data["tasks"][0]["evidence"] = {
+        "labelled_cases": [
+            {"case_id": f"case-{index}", "expected_points": 0} for index in range(50)
+        ],
+        "representative_cases": [
+            {"case_id": f"case-{index}", "count": 1} for index in range(50, 100)
+        ],
+    }
+    expectations = [(f"case-{index}", 0) for index in range(100)]
+    client = ScriptedCompletion(
+        [
+            _synthesis(["Paris"], expectations=expectations),
+            _synthesis(["Rome"], expectations=expectations),
+            _verified,
+        ]
+    )
+    result = asyncio.run(
+        RuleGenerator(TEST_LITELLM_CONFIG).generate(GenerationRequest.model_validate(data))
+    )
+    assert result.status == "verified"
+    regeneration = payload_from_message(client.calls[1][0][-1].content)["regeneration"]
+    assert len(regeneration["model_case_expectations"]) == 100
+    assert len(regeneration["cited_test_results"]) == 50
+    review = payload_from_message(client.calls[2][0][-1].content)
+    assert len(review["test_results"]) == 100
+    assert all(item["actual_points"] == 0 for item in review["test_results"])

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from collections.abc import Sequence
 from typing import Any
 
 import pytest
 from gradeflow_engine.questions.models import ChoiceQuestion
 from gradeflow_engine.rubrics.model import Rubric
+from pydantic import TypeAdapter
 
 import rulegen.generator as generator_module
 import rulegen.hydration as hydration_module
@@ -30,7 +30,8 @@ from rulegen.generator import (
     _PreparedQuestionJob,
 )
 from rulegen.llm import ChatMessage
-from rulegen.models import BehavioralContract
+from rulegen.models import ModelCaseExpectation
+from rulegen.prompts import payload_from_message
 from rulegen.requests import GenerationLimits
 from rulegen.teacher_actions import TeacherAction, TeacherActionRequest
 from rulegen.validation import CatalogValidationError
@@ -72,24 +73,23 @@ def _capturing_generator(
 def _candidate_payload(*, q2_answer: str = "b") -> dict[str, Any]:
     return {
         "outcome": "candidate",
-        "summary": "Award both correct answers.",
-        "rule": {
-            "type": "ASSUMPTION_SET_MULTI",
-            "mode": "MAX",
-            "assumptions": [
-                {
-                    "name": "expected pair",
-                    "weight": 1.0,
-                    "rules": [
-                        {"question_id": "q1", "type": "TEXT_MATCH", "answers": ["a"]},
-                        {"question_id": "q2", "type": "TEXT_MATCH", "answers": [q2_answer]},
-                    ],
-                }
-            ],
-        },
-        "behavioral_contract": {
-            "interpretation": "Both supplied answers receive full credit.",
-            "case_expectations": [
+        "result": {
+            "summary": "Award both correct answers.",
+            "rule": {
+                "type": "ASSUMPTION_SET_MULTI",
+                "mode": "MAX",
+                "assumptions": [
+                    {
+                        "name": "expected pair",
+                        "weight": 1.0,
+                        "rules": [
+                            {"question_id": "q1", "type": "TEXT_MATCH", "answers": ["a"]},
+                            {"question_id": "q2", "type": "TEXT_MATCH", "answers": [q2_answer]},
+                        ],
+                    }
+                ],
+            },
+            "model_case_expectations": [
                 {"source_id": "case-1", "expected_points": 2, "reason": "Both match."}
             ],
         },
@@ -115,13 +115,13 @@ def test_build_mixed_children_preserves_target_scope_and_case_projection() -> No
     group = children[1][1]
     assert isinstance(single, _PreparedQuestionJob)
     assert isinstance(group, _PreparedGroupJob)
-    assert single.llm_request.teacher_labelled_examples[0].model_dump() == {
+    assert single.llm_request.teacher_case_expectations[0].model_dump() == {
         "source_id": "shared-case",
         "answers": {"q1": "a"},
         "expected_points": 1.0,
     }
     assert single.llm_request.teacher_intent == request.teacher_intent
-    assert single.llm_request.representative_student_answers[0].count == 7
+    assert single.llm_request.representative_cases[0].count == 7
     assert {label.case_id: label.expected_points for label in single.labelled_cases} == {
         "shared-case": 1
     }
@@ -129,11 +129,11 @@ def test_build_mixed_children_preserves_target_scope_and_case_projection() -> No
         {"case_id": "shared-case", "answer_map": {"q1": "a"}},
         {"case_id": "single-rep", "answer_map": {"q1": "x"}},
     ]
-    assert group.llm_request.teacher_labelled_examples[0].answers == {"q2": "y", "q3": "z"}
+    assert group.llm_request.teacher_case_expectations[0].answers == {"q2": "y", "q3": "z"}
     assert group.llm_request.teacher_intent == request.teacher_intent
-    assert group.llm_request.teacher_labelled_examples[0].expected_points == 2
-    assert group.llm_request.representative_student_answers[0].answers == {"q2": "b", "q3": "c"}
-    assert group.llm_request.representative_student_answers[0].count == 4
+    assert group.llm_request.teacher_case_expectations[0].expected_points == 2
+    assert group.llm_request.representative_cases[0].answers == {"q2": "b", "q3": "c"}
+    assert group.llm_request.representative_cases[0].count == 4
     assert {label.case_id: label.expected_points for label in group.labelled_cases} == {
         "group-label": 2
     }
@@ -151,22 +151,19 @@ def test_routed_expected_score_rejects_a_candidate_with_wrong_local_points() -> 
         question_type="TEXT",
     )
     execution = execute_candidate_rule(candidate, child.question_set, child.cases)
-    contract = BehavioralContract.model_validate(
-        {
-            "interpretation": "Match the observed candidate behavior.",
-            "case_expectations": [
-                {
-                    "source_id": "shared-case",
-                    "expected_points": 1,
-                    "reason": "Teacher-labelled full credit.",
-                },
-                {"source_id": "single-rep", "expected_points": 1, "reason": "Accepted."},
-            ],
-        }
+    expectations = TypeAdapter(list[ModelCaseExpectation]).validate_python(
+        [
+            {
+                "source_id": "shared-case",
+                "expected_points": 1,
+                "reason": "Teacher-labelled full credit.",
+            },
+            {"source_id": "single-rep", "expected_points": 1, "reason": "Accepted."},
+        ]
     )
-    verification = RuleGenerator._verification_request(child, candidate, execution, contract)
-    assert verification.mismatch_test_result_ids == ["shared-case"]
-    assert verification.contract_mismatch_test_result_ids == ["shared-case"]
+    verification = RuleGenerator._verification_request(child, candidate, execution, expectations)
+    assert verification.teacher_label_mismatch_test_result_ids == ["shared-case"]
+    assert verification.model_expectation_mismatch_test_result_ids == ["shared-case"]
     assert verification.test_results[0].expected_points == 1
 
 
@@ -324,8 +321,8 @@ def test_preparation_projects_only_declared_cases() -> None:
     assert {label.case_id: label.expected_points for label in jobs[0][1].labelled_cases} == {
         "label": 1
     }
-    assert payload.teacher_labelled_examples[0].answers == {"q1": "yes"}
-    assert payload.representative_student_answers[0].answers == {"q1": "no"}
+    assert payload.teacher_case_expectations[0].answers == {"q1": "yes"}
+    assert payload.representative_cases[0].answers == {"q1": "no"}
 
 
 def test_group_membership_and_declared_order_are_preserved() -> None:
@@ -340,7 +337,7 @@ def test_group_membership_and_declared_order_are_preserved() -> None:
     payload = preparation_build_payload(request)
     jobs = _prepare_jobs(request)
     assert [question.question_id for question in payload.questions] == ["q2", "q1"]
-    assert list(payload.teacher_labelled_examples[0].answers) == ["q2", "q1"]
+    assert list(payload.teacher_case_expectations[0].answers) == ["q2", "q1"]
     assert [list(case.answer_map) for case in jobs[0][1].cases] == [["q2", "q1"]]
 
 
@@ -351,7 +348,7 @@ def test_group_duplicate_rule_values_use_catalog_retry_after_hydration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     duplicate_candidate = _candidate_payload()
-    duplicate_candidate["rule"]["assumptions"][0]["rules"][0]["answers"] = ["a", "a"]
+    duplicate_candidate["result"]["rule"]["assumptions"][0]["rules"][0]["answers"] = ["a", "a"]
     client = ScriptedCompletion(
         [
             duplicate_candidate,
@@ -370,11 +367,12 @@ def test_group_duplicate_rule_values_use_catalog_retry_after_hydration(
     monkeypatch.setattr(hydration_module, "hydrate_rule", track_hydrate)
     result = asyncio.run(RuleGenerator(TEST_LITELLM_CONFIG).generate_group(group_request()))
     assert result.status == "verified"
-    assert client.requests[0]["response_format"]["json_schema"]["name"] == "SynthesisResult"
+    assert client.requests[0]["response_format"]["json_schema"]["name"] == "SynthesisResponse"
     assert len(client.calls) == 3
-    retry_payload = json.loads(client.calls[1][0][-1].content)
+    retry_payload = payload_from_message(client.calls[1][0][-1].content)
     assert retry_payload["format_retry"]["reason"] == "local_shape_or_catalog_validation_failed"
     assert retry_payload["format_retry"]["error_codes"] == ["duplicate_rule_values"]
+    assert retry_payload["format_retry"]["field_paths"] == ["result.rule"]
     assert [strategy.type for strategy in hydrated_strategies] == [
         "ASSUMPTION_SET_MULTI",
         "ASSUMPTION_SET_MULTI",
@@ -386,11 +384,16 @@ def test_generate_group_promotes_ambiguous_no_safe_candidate_to_teacher_action()
         [
             {
                 "outcome": "no_safe_candidate",
-                "reason_code": "ambiguous_intent",
-                "explanation": "The partial-credit policy is ambiguous.",
-                "teacher_actions": [
-                    "Revise the teacher intent to state how partial credit works for this group."
-                ],
+                "result": {
+                    "reason_code": "ambiguous_intent",
+                    "explanation": "The partial-credit policy is ambiguous.",
+                    "teacher_actions": [
+                        (
+                            "Revise the teacher intent to state how partial credit "
+                            "works for this group."
+                        )
+                    ],
+                },
             }
         ]
     )
@@ -425,15 +428,15 @@ def test_group_generation_resolves_optional_rule_kinds(target_options, expected_
     _assert_request_schema_is_visible(client.requests[1])
     assert group_schema["discriminator"]["propertyName"] == "outcome"
     assert "result" not in group_schema.get("properties", {})
-    synthesis_request = json.loads(client.calls[0][0][-1].content)
+    synthesis_request = payload_from_message(client.calls[0][0][-1].content)
     assert synthesis_request["allowed_rule_kinds"] == expected_kinds
     assert request.tasks[0].target.allowed_rule_kinds == target_options.get("allowed_rule_kinds")
     assert result.candidate is not None
-    verification_request = json.loads(client.calls[1][0][-1].content)
-    assert verification_request["rule"] == _candidate_payload()["rule"]
+    verification_request = payload_from_message(client.calls[1][0][-1].content)
+    assert verification_request["rule"] == _candidate_payload()["result"]["rule"]
     nested = verification_request["rule"]["assumptions"][0]["rules"]
     assert [rule["question_id"] for rule in nested] == ["q1", "q2"]
-    assert nested == _candidate_payload()["rule"]["assumptions"][0]["rules"]
+    assert nested == _candidate_payload()["result"]["rule"]["assumptions"][0]["rules"]
 
 
 def test_generate_group_regenerates_after_local_outcome_mismatch() -> None:
@@ -451,12 +454,14 @@ def test_generate_group_regenerates_after_local_outcome_mismatch() -> None:
         "synthesis",
         "verification",
     ]
-    second_synthesis_request = json.loads(client.calls[1][0][-1].content)
+    second_synthesis_request = payload_from_message(client.calls[1][0][-1].content)
     regenerated_rule = second_synthesis_request["regeneration"]["rule"]
     nested = regenerated_rule["assumptions"][0]["rules"]
-    assert regenerated_rule == _candidate_payload(q2_answer="wrong")["rule"]
+    assert regenerated_rule == _candidate_payload(q2_answer="wrong")["result"]["rule"]
     assert [rule["question_id"] for rule in nested] == ["q1", "q2"]
-    assert nested == _candidate_payload(q2_answer="wrong")["rule"]["assumptions"][0]["rules"]
+    assert (
+        nested == _candidate_payload(q2_answer="wrong")["result"]["rule"]["assumptions"][0]["rules"]
+    )
     assert [
         result["test_result_id"]
         for result in second_synthesis_request["regeneration"]["cited_test_results"]

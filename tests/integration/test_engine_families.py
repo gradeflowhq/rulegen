@@ -19,9 +19,10 @@ from rulegen import (
     TargetLabelledCase,
     TargetTask,
 )
+from rulegen.prompts import payload_from_message
 from tests.support.completion import TEST_LITELLM_CONFIG as TEST_LITELLM_CONFIG
 from tests.support.completion import ScriptedCompletion as ScriptedCompletion
-from tests.support.completion import _behavioral_contract as _behavioral_contract
+from tests.support.completion import _model_case_expectations as _model_case_expectations
 from tests.support.completion import _verified as _verified
 
 TEXT = {"type": "TEXT_MATCH", "answers": ["yes"]}
@@ -33,9 +34,11 @@ BONUS = {"type": "BONUS"}
 def synthesis(strategy, expectations):
     return {
         "outcome": "candidate",
-        "summary": "Apply the supplied grading policy.",
-        "rule": strategy,
-        "behavioral_contract": _behavioral_contract(expectations),
+        "result": {
+            "summary": "Apply the supplied grading policy.",
+            "rule": strategy,
+            "model_case_expectations": _model_case_expectations(expectations),
+        },
     }
 
 
@@ -147,7 +150,7 @@ def test_new_family_generation_executes_and_verifies(strategy, question, cases):
     assert result.status == "verified"
     assert result.candidate is not None
     assert result.candidate.type.lower() == strategy["type"].lower()
-    verification = json.loads(client.calls[1][0][-1].content)
+    verification = payload_from_message(client.calls[1][0][-1].content)
     assert verification["questions"][0]["type"] == question.type
     assert [item["answer"] for item in verification["test_results"]] == [a for a, _ in cases]
     assert [item["actual_points"] for item in verification["test_results"]] == [p for _, p in cases]
@@ -211,7 +214,7 @@ def test_new_families_work_inside_group_and_mixed_generation(family):
     result = asyncio.run(RuleGenerator(TEST_LITELLM_CONFIG).generate_mixed(request))
     assert list(result.results_by_target_id) == ['group:["text","values"]', "bonus"]
     assert all(item.status == "verified" for item in result.results_by_target_id.values())
-    verification = json.loads(client.calls[1][0][-1].content)
+    verification = payload_from_message(client.calls[1][0][-1].content)
     assert [q["question_id"] for q in verification["questions"]] == ["text", "values"]
     assert verification["test_results"][0]["answers"] == {"text": "yes", "values": [3, "yes"]}
 

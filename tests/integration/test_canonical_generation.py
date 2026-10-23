@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 
 import pytest
 from gradeflow_engine.question_sets.model import QuestionSet
@@ -19,6 +18,7 @@ from rulegen import (
     TargetRepresentativeCase,
     TargetTask,
 )
+from rulegen.prompts import payload_from_message
 from tests.support.completion import TEST_LITELLM_CONFIG as TEST_LITELLM_CONFIG
 from tests.support.completion import ScriptedCompletion as ScriptedCompletion
 from tests.support.completion import _synthesis as _synthesis
@@ -60,9 +60,11 @@ def test_canonical_standalone_and_batch_keep_payloads_and_results_consistent() -
     batch = asyncio.run(RuleGenerator(TEST_LITELLM_CONFIG).generate_mixed(request))
     assert standalone.status == batch.results_by_target_id["q1"].status == "verified"
     standalone_payloads = [
-        json.loads(messages[-1].content) for messages, _ in standalone_client.calls
+        payload_from_message(messages[-1].content) for messages, _ in standalone_client.calls
     ]
-    batch_payloads = [json.loads(messages[-1].content) for messages, _ in batch_client.calls]
+    batch_payloads = [
+        payload_from_message(messages[-1].content) for messages, _ in batch_client.calls
+    ]
     assert standalone.candidate is not None
     assert batch.results_by_target_id["q1"].candidate is not None
     assert standalone_payloads[1]["rule"] == {"type": "TEXT_MATCH", "answers": ["Paris"]}
@@ -71,8 +73,8 @@ def test_canonical_standalone_and_batch_keep_payloads_and_results_consistent() -
     assert "hidden" not in disclosed
     assert "undisclosed" not in disclosed
     assert "secret" not in disclosed
-    payload = json.loads(standalone_client.calls[0][0][-1].content)
-    assert payload["representative_student_answers"][0]["count"] == 3
+    payload = payload_from_message(standalone_client.calls[0][0][-1].content)
+    assert payload["representative_cases"][0]["count"] == 3
 
 
 def test_later_invalid_task_blocks_all_llm_calls() -> None:

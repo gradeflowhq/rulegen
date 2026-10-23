@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, TypeAlias
 
 JSONSchema: TypeAlias = Mapping[str, Any]
-MessageRole: TypeAlias = Literal["system", "user", "assistant"]
+MessageRole: TypeAlias = Literal["user", "assistant"]
 
 
 @dataclass(frozen=True, slots=True)

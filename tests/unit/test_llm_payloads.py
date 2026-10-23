@@ -5,7 +5,7 @@ import json
 import pytest
 from gradeflow_engine.question_sets.model import QuestionSet
 from gradeflow_engine.questions.models import ChoiceQuestion, TextQuestion
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from rulegen import (
     CandidateTestCase,
@@ -18,14 +18,14 @@ from rulegen import (
 from rulegen.llm_payloads import (
     LLMGenerationRequest,
     LLMQuestion,
-    LLMRepresentativeStudentAnswer,
-    LLMTeacherLabelledExample,
+    LLMRepresentativeCase,
+    LLMTeacherCaseExpectation,
     LLMVerificationRequest,
     RegenerationContext,
     VerificationTestResult,
     build_llm_generation_payload,
 )
-from rulegen.models import BehavioralContract
+from rulegen.models import ModelCaseExpectation
 from rulegen.preflight import preflight_check
 from rulegen.registry import resolve_target_rule_kinds
 from rulegen.response_schemas import synthesis_response_schema
@@ -74,18 +74,15 @@ def _requests_build_payload(request: GenerationRequest, task: TargetTask | None 
     )
 
 
-def _verification_contract() -> BehavioralContract:
-    return BehavioralContract.model_validate(
-        {
-            "interpretation": "Accept Paris.",
-            "case_expectations": [
-                {
-                    "source_id": "representative",
-                    "expected_points": 1,
-                    "reason": "Matches the intended answer.",
-                }
-            ],
-        }
+def _verification_expectations() -> list[ModelCaseExpectation]:
+    return TypeAdapter(list[ModelCaseExpectation]).validate_python(
+        [
+            {
+                "source_id": "representative",
+                "expected_points": 1,
+                "reason": "Matches the intended answer.",
+            }
+        ]
     )
 
 
@@ -94,7 +91,7 @@ def _verification_request() -> LLMVerificationRequest:
         questions=[LLMQuestion(question_id="q1", type="TEXT", max_points=1)],
         teacher_intent="Accept Paris.",
         rule={"kind": "TEXT_MATCH"},
-        behavioral_contract=_verification_contract(),
+        model_case_expectations=_verification_expectations(),
         test_results=[
             VerificationTestResult(
                 test_result_id="representative",
@@ -195,7 +192,7 @@ def test_deterministic_choice_answers_and_case_source_catalog() -> None:
         task=request.tasks[0],
         resolved_rule_kinds=resolved,
     )
-    assert payload.teacher_labelled_examples[0].answers == {"q": ["a", "b"]}
+    assert payload.teacher_case_expectations[0].answers == {"q": ["a", "b"]}
 
 
 # Trusted multi-valued payloads
@@ -238,7 +235,7 @@ def test_generation_payload_preserves_multi_value_types_order_and_answer_values(
     assert isinstance(payload.question, LLMQuestion)
     assert payload.question.type == "MULTI_VALUED"
     assert payload.question.value_types == ["TEXT", "NUMERIC"]
-    assert payload.teacher_labelled_examples[0].answers == {"parts": ["alpha", 2.5]}
+    assert payload.teacher_case_expectations[0].answers == {"parts": ["alpha", 2.5]}
 
 
 # LLM request contracts and compatible rule projection
@@ -247,14 +244,14 @@ def test_generation_payload_preserves_multi_value_types_order_and_answer_values(
 @pytest.mark.parametrize("points", [[1], [0], [1, 1], [0, 0]])
 def test_llm_request_accepts_one_sided_optional_labels(points: list[int]) -> None:
     payload = llm_request().model_dump()
-    payload["teacher_labelled_examples"] = [
-        LLMTeacherLabelledExample(
+    payload["teacher_case_expectations"] = [
+        LLMTeacherCaseExpectation(
             source_id=f"label-{index}", answers={"q1": f"answer-{index}"}, expected_points=point
         ).model_dump()
         for index, point in enumerate(points)
     ]
     parsed = LLMGenerationRequest.model_validate(payload)
-    assert [example.expected_points for example in parsed.teacher_labelled_examples] == points
+    assert [example.expected_points for example in parsed.teacher_case_expectations] == points
 
 
 def test_llm_request_accepts_zero_labels_with_representative() -> None:
@@ -264,43 +261,55 @@ def test_llm_request_accepts_zero_labels_with_representative() -> None:
             question_id="q1", type="TEXT", max_points=1, description="Name the capital of France."
         ),
         teacher_intent="Accept Paris exactly.",
-        representative_student_answers=[
-            LLMRepresentativeStudentAnswer(
-                source_id="representative", answers={"q1": "Paris"}, count=2
-            )
+        representative_cases=[
+            LLMRepresentativeCase(source_id="representative", answers={"q1": "Paris"}, count=2)
         ],
     )
-    assert parsed.teacher_labelled_examples == []
+    assert parsed.teacher_case_expectations == []
 
 
-def test_llm_request_rejects_zero_total_executable_cases() -> None:
-    with pytest.raises(ValidationError, match="executable authoring case"):
-        LLMGenerationRequest(
-            allowed_rule_kinds=["text_match"],
-            question=LLMQuestion(question_id="q1", type="TEXT", max_points=1),
-            teacher_intent="Accept Paris exactly.",
-        )
+@pytest.mark.parametrize("factory", [llm_request, group_payload])
+def test_outbound_projection_construction_only_validates_transport_contract(factory) -> None:
+    payload = factory()
+    data = payload.model_dump()
+    data["teacher_case_expectations"] = []
+    data["representative_cases"] = []
+    parsed = type(payload).model_validate(data)
+    assert parsed.teacher_case_expectations == []
+    assert parsed.representative_cases == []
+
+    # Uniqueness belongs to the trusted request, even for exported payload models.
+    case = {"source_id": "case", "answers": {"q1": "Paris"}, "expected_points": 1}
+    data["teacher_case_expectations"] = [case, case]
+    data["representative_cases"] = [{"source_id": "case", "answers": {"q1": "Paris"}, "count": 1}]
+    if "questions" in data:
+        data["questions"] = [data["questions"][0], data["questions"][0]]
+    parsed = type(payload).model_validate(data)
+    assert parsed.model_dump(mode="json") == data
 
 
 def test_llm_nested_collections_are_bounded() -> None:
     with pytest.raises(ValidationError):
-        LLMTeacherLabelledExample(
+        LLMTeacherCaseExpectation(
             source_id="example",
             answers={"q1": [f"choice-{index}" for index in range(51)]},
             expected_points=0,
         )
 
 
-def test_llm_example_collection_is_bounded() -> None:
-    payload = llm_request().model_dump()
-    payload["teacher_labelled_examples"] = [
-        LLMTeacherLabelledExample(
-            source_id=f"example-{index}", answers={"q1": "Paris"}, expected_points=1
-        ).model_dump()
-        for index in range(51)
-    ]
-    with pytest.raises(ValidationError):
-        LLMGenerationRequest.model_validate(payload)
+@pytest.mark.parametrize("factory", [llm_request, group_payload])
+@pytest.mark.parametrize("field", ["teacher_case_expectations", "representative_cases"])
+def test_llm_example_collection_is_bounded(factory, field) -> None:
+    model = factory()
+    payload = model.model_dump()
+    case = (
+        {"source_id": "case", "answers": {"q1": "Paris"}, "expected_points": 1}
+        if field == "teacher_case_expectations"
+        else {"source_id": "case", "answers": {"q1": "Paris"}, "count": 1}
+    )
+    payload[field] = [case] * 51
+    with pytest.raises(ValidationError, match=field):
+        type(model).model_validate(payload)
 
 
 def test_question_target_derives_supported_compatible_rule_kinds() -> None:
@@ -318,7 +327,7 @@ def test_question_target_derives_supported_compatible_rule_kinds() -> None:
     }
     assert "regex" not in payload.allowed_rule_kinds
     schema = synthesis_response_schema(payload)
-    strategy = schema["$defs"]["SynthesisCandidate"]["properties"]["rule"]
+    strategy = schema["$defs"]["SynthesisCandidatePayload"]["properties"]["rule"]
     assert set(strategy["discriminator"]["mapping"]) == {
         kind.upper() for kind in payload.allowed_rule_kinds
     }
@@ -357,7 +366,7 @@ def test_verification_request_has_no_clarification_catalog() -> None:
 def test_regeneration_context_allows_zero_citations() -> None:
     base = {
         "rule": {"kind": "TEXT_MATCH"},
-        "behavioral_contract": _verification_contract(),
+        "model_case_expectations": _verification_expectations(),
         "failure": {
             "kind": "behavioral_mismatch",
             "reason_codes": ["insufficient_coverage"],
@@ -379,11 +388,9 @@ def test_copied_gradeflow_data_fixtures_build_identity_free_requests() -> None:
 
         assert llm_request.question.choice_options
         assert all(llm_request.question.choice_options.values())
-        assert llm_request.teacher_labelled_examples == []
+        assert llm_request.teacher_case_expectations == []
         assert request.tasks[0].evidence.labelled_cases == []
-        representative_ids = {
-            answer.source_id for answer in llm_request.representative_student_answers
-        }
+        representative_ids = {answer.source_id for answer in llm_request.representative_cases}
         assert representative_ids == {example.label.case_id for example in fixture.examples}
         assert all(
             example.label.case_id.startswith(("demo-case-", "exam-case-"))
@@ -405,10 +412,10 @@ def test_copied_gradeflow_data_fixtures_build_requests_with_labelled_examples() 
         request = _build_request(fixture, include_labelled_examples=True)
         llm_request = _prepared_llm_request(request)
 
-        assert llm_request.representative_student_answers == []
+        assert llm_request.representative_cases == []
         assert {
             example.source_id: example.expected_points
-            for example in llm_request.teacher_labelled_examples
+            for example in llm_request.teacher_case_expectations
         } == {example.label.case_id: example.label.expected_points for example in fixture.examples}
         assert {
             label.case_id: label.expected_points
@@ -424,5 +431,5 @@ def test_exam_fixture_preserves_case_normalization_from_source_question() -> Non
     assert fixture.question.config.normalize_case is True
     assert request.question_set.question_map["Q2"].config.normalize_case is True
     assert request.cases[0].answer_map["Q2"] == {"d"}
-    assert llm_request.representative_student_answers[0].answers == {"Q2": ["d"]}
+    assert llm_request.representative_cases[0].answers == {"Q2": ["d"]}
     assert "choice d" not in llm_request.teacher_intent.lower()

@@ -165,7 +165,7 @@ def test_missing_answer_key_is_distinct_from_explicit_none() -> None:
         cases=(CandidateTestCase(case_id="case", answer_map={"q1": None}),),
     )
     payload = preparation_build_payload(accepted)
-    assert payload.teacher_labelled_examples[0].answers == {"q1": None}
+    assert payload.teacher_case_expectations[0].answers == {"q1": None}
 
     with pytest.raises(ValueError, match="answer every target question"):
         preparation_request(

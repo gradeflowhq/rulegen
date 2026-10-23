@@ -1,20 +1,22 @@
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from rulegen.llm_payloads import (
     LLMGenerationRequest,
     LLMQuestion,
-    LLMRepresentativeStudentAnswer,
+    LLMRepresentativeCase,
     build_llm_generation_payload,
 )
 from rulegen.preflight import preflight_check
 from rulegen.prompts import (
+    GENERATION_INSTRUCTIONS,
+    REQUEST_PAYLOAD_SEPARATOR,
+    VERIFICATION_INSTRUCTIONS,
     FormatRetryContext,
     generation_messages,
     group_generation_messages,
+    payload_from_message,
     verification_messages,
 )
 from rulegen.registry import resolve_target_rule_kinds
@@ -43,11 +45,9 @@ def _representative_request(
             description="Should this statement be accepted?",
         ),
         teacher_intent=instruction,
-        teacher_labelled_examples=[],
-        representative_student_answers=[
-            LLMRepresentativeStudentAnswer(
-                source_id="representative-1", answers={"q1": "yes"}, count=3
-            )
+        teacher_case_expectations=[],
+        representative_cases=[
+            LLMRepresentativeCase(source_id="representative-1", answers={"q1": "yes"}, count=3)
         ],
     )
 
@@ -71,7 +71,9 @@ def _build_payload(request):
 )
 def test_llm_payload_serializes_teacher_intent_as_string(factory, messages):
     request = factory()
-    assert json.loads(messages(request)[1].content)["teacher_intent"] == request.teacher_intent
+    assert (
+        payload_from_message(messages(request).content)["teacher_intent"] == request.teacher_intent
+    )
     schema = type(request).model_json_schema()["properties"]["teacher_intent"]
     assert schema["type"] == "string"
     assert schema["minLength"] == 1
@@ -87,26 +89,34 @@ def test_generation_prompt_is_comments_first_and_keeps_injection_nested_as_data(
 
     messages = generation_messages(request)
 
-    assert len(messages) == 2
-    assert messages[0].role == "system"
-    instructions = messages[0].content
+    assert messages.role == "user"
+    assert messages.content.startswith(GENERATION_INSTRUCTIONS + REQUEST_PAYLOAD_SEPARATOR)
+    assert messages.content.partition(REQUEST_PAYLOAD_SEPARATOR)[0] == GENERATION_INSTRUCTIONS
+    assert malicious not in GENERATION_INSTRUCTIONS
+    assert (
+        generation_messages(_representative_request()).content.partition(REQUEST_PAYLOAD_SEPARATOR)[
+            0
+        ]
+        == GENERATION_INSTRUCTIONS
+    )
+    instructions = messages.content
     for requirement in (
         "Teacher intent is the primary desired-outcome specification",
         "Labels are authoritative only for the cited cases",
-        "Infer their expected scores from teacher intent",
+        "Infer representative expected scores from teacher intent",
         "Never infer correctness or grading policy from answer frequency or cluster size",
         "Do not ask the teacher to classify student answers or provide new per-answer labels",
-        "When teacher intent and labelled examples conflict",
+        "When teacher intent and teacher case expectations conflict",
         "Academic-answer uncertainty is not a grading-policy clarification",
-        "exactly one expectation for every supplied teacher-labelled or representative case",
+        "exactly one model case expectation for every supplied teacher case expectation",
         "only JSON matching the supplied response schema",
     ):
         assert requirement in instructions
-    payload = json.loads(messages[1].content)
-    assert payload["teacher_labelled_examples"] == []
-    assert payload["representative_student_answers"][0]["answers"] == {"q1": "yes"}
+    payload = payload_from_message(messages.content)
+    assert payload["teacher_case_expectations"] == []
+    assert payload["representative_cases"][0]["answers"] == {"q1": "yes"}
     assert payload["teacher_intent"] == malicious
-    assert "api_key" not in messages[1].content.lower()
+    assert "api_key" not in messages.content.lower()
 
 
 def test_generation_prompt_includes_displayed_choice_labels_but_requires_choice_ids() -> None:
@@ -120,23 +130,21 @@ def test_generation_prompt_includes_displayed_choice_labels_but_requires_choice_
             choice_options={"a": malicious, "b": "Ordinary option"},
         ),
         teacher_intent="Award credit for the correct option.",
-        representative_student_answers=[
-            LLMRepresentativeStudentAnswer(
-                source_id="representative-a", answers={"q1": ["a"]}, count=1
-            )
+        representative_cases=[
+            LLMRepresentativeCase(source_id="representative-a", answers={"q1": ["a"]}, count=1)
         ],
     )
 
     messages = generation_messages(request)
-    payload = json.loads(messages[-1].content)
+    payload = payload_from_message(messages.content)
 
     assert payload["question"]["choice_options"] == {
         "a": malicious,
         "b": "Ordinary option",
     }
-    assert "choice option text as context" in messages[0].content
-    assert "only choice IDs" in messages[0].content
-    assert "never use the displayed option text" in messages[0].content
+    assert "choice option text as context" in messages.content
+    assert "only choice IDs" in messages.content
+    assert "never use the displayed option text" in messages.content
 
 
 def test_generation_prompt_teaches_exact_set_mcq_and_choice_cardinality() -> None:
@@ -149,16 +157,14 @@ def test_generation_prompt_teaches_exact_set_mcq_and_choice_cardinality() -> Non
             choice_options={"a": "First", "b": "Second", "c": "Third"},
         ),
         teacher_intent="Award credit if and only if the selected set is {a, b}.",
-        representative_student_answers=[
-            LLMRepresentativeStudentAnswer(
-                source_id="selected-ab", answers={"q1": ["a", "b"]}, count=1
-            )
+        representative_cases=[
+            LLMRepresentativeCase(source_id="selected-ab", answers={"q1": ["a", "b"]}, count=1)
         ],
     )
 
     messages = generation_messages(request)
-    instructions = messages[0].content
-    payload = json.loads(messages[1].content)
+    instructions = messages.content
+    payload = payload_from_message(messages.content)
 
     assert "selected choice-ID set equals the accepted choice set exactly" in instructions
     assert "missing or extra selections fail" in instructions
@@ -177,7 +183,7 @@ def test_generation_prompt_teaches_exact_set_mcq_and_choice_cardinality() -> Non
 
 def test_generation_prompt_reserves_unsupported_and_requires_actionable_prompts() -> None:
     messages = generation_messages(_representative_request())
-    instructions = messages[0].content
+    instructions = messages.content
 
     assert "Outcome gate — decide the outcome before drafting the explanation:" in instructions
     assert "If it can, the outcome is `candidate`" in instructions
@@ -207,21 +213,21 @@ def test_generation_prompt_reserves_unsupported_and_requires_actionable_prompts(
 
 def test_verification_prompt_defines_comments_first_semantic_decision() -> None:
     messages = verification_messages(verification_request())
-    instructions = messages[0].content
+    instructions = messages.content
 
-    payload = json.loads(messages[1].content)
+    payload = payload_from_message(messages.content)
     assert payload["test_results"][0]["expected_points"] is None
     for requirement in (
-        "supplied rule semantics, the behavioral contract, and authoritative engine observations",
+        "supplied rule semantics, model case expectations, and authoritative engine observations",
         "original teacher intent/comments",
         "editable rule and auxiliary fields",
         "including defaulted settings",
         "Grouped question IDs identify the declared evaluation targets",
-        "expected_points null means an unlabelled hypothesis",
+        "expected_points null in an engine observation means no teacher label",
         "Never ask the teacher to label or classify a student answer",
         "Never create teacher-action prompts",
         "Academic-answer uncertainty is not a teacher clarification",
-        "Return verified when intent, contract, and observations align",
+        "Return verified when intent, rule, model case expectations, and observations align",
         "Return regenerate for semantic misinterpretation",
         "Verification has exactly two outcomes",
     ):
@@ -235,11 +241,11 @@ def test_format_retry_contains_only_bounded_safe_diagnostics() -> None:
         field_paths=("outcome",),
     )
 
-    generation_payload = json.loads(
-        generation_messages(_representative_request(), format_retry=retry)[-1].content
+    generation_payload = payload_from_message(
+        generation_messages(_representative_request(), format_retry=retry).content
     )
-    verification_payload = json.loads(
-        verification_messages(verification_request(), format_retry=retry)[-1].content
+    verification_payload = payload_from_message(
+        verification_messages(verification_request(), format_retry=retry).content
     )
     expected = {
         "reason": "local_shape_or_catalog_validation_failed",
@@ -277,7 +283,7 @@ def test_group_question_order_controls_prompt_and_validation() -> None:
     request = group_request()
     request.tasks[0].target.question_ids.reverse()
     llm_request = _build_payload(request)
-    payload = json.loads(group_generation_messages(llm_request)[1].content)
+    payload = payload_from_message(group_generation_messages(llm_request).content)
     assert [q["question_id"] for q in payload["questions"]] == ["q2", "q1"]
     strategy = group_strategy()
     for assumption in strategy["assumptions"]:
@@ -291,3 +297,51 @@ def test_group_question_order_controls_prompt_and_validation() -> None:
             target_question_ids=llm_request.question_ids,
             question_set=request.question_set,
         )
+
+
+@pytest.mark.parametrize(
+    ("factory", "request_factory", "instructions"),
+    [
+        (generation_messages, llm_request, GENERATION_INSTRUCTIONS),
+        (group_generation_messages, group_payload, GENERATION_INSTRUCTIONS),
+        (verification_messages, verification_request, VERIFICATION_INSTRUCTIONS),
+    ],
+)
+def test_phase_turn_preserves_phase_data_and_instruction_boundary(
+    factory, request_factory, instructions
+):
+    request = request_factory()
+    message = factory(request)
+    prefix, separator, _ = message.content.partition(REQUEST_PAYLOAD_SEPARATOR)
+    assert message.role == "user"
+    assert prefix == instructions
+    assert separator == REQUEST_PAYLOAD_SEPARATOR
+    payload = payload_from_message(message.content)
+    assert payload.pop("phase") == (
+        "verification" if factory is verification_messages else "generation"
+    )
+    if factory is group_generation_messages:
+        guidance = payload.pop("combined_rule_guidance")
+        assert "group membership and order" in guidance
+        assert "Never add, omit, reorder, or split group questions" in guidance
+    assert payload == request.model_dump(mode="json")
+    assert type(request).model_validate(payload) == request
+
+    changed = request.model_copy(update={"teacher_intent": "Different teacher intent 日本語"})
+    changed_message = factory(changed)
+    assert changed_message.content.partition(REQUEST_PAYLOAD_SEPARATOR)[0] == instructions
+    assert payload_from_message(changed_message.content)["teacher_intent"] == changed.teacher_intent
+    assert "Supported rule families and engine behavior:" not in VERIFICATION_INSTRUCTIONS
+
+
+@pytest.mark.parametrize("content", ["{}", REQUEST_PAYLOAD_SEPARATOR + "[]"])
+def test_payload_from_message_rejects_missing_boundary_or_non_object(content):
+    with pytest.raises(ValueError):
+        payload_from_message(content)
+
+
+def test_payload_boundary_text_inside_teacher_intent_remains_data():
+    request = _representative_request(instruction=REQUEST_PAYLOAD_SEPARATOR + "日本語")
+    message = generation_messages(request)
+    assert payload_from_message(message.content)["teacher_intent"] == request.teacher_intent
+    assert message.content.partition(REQUEST_PAYLOAD_SEPARATOR)[0] == GENERATION_INSTRUCTIONS

@@ -17,7 +17,7 @@ from pydantic import TypeAdapter, ValidationError
 import rulegen.generator as rulegen_generator
 from rulegen import RuleGenerationResult, RuleGenerator
 from rulegen.llm_payloads import LLMGroupGenerationRequest, build_llm_generation_payload
-from rulegen.models import NoSafeCandidate, SynthesisResult, VerificationResult
+from rulegen.models import NoSafeCandidate, SynthesisResponse, VerificationResult
 from rulegen.preflight import preflight_check
 from rulegen.registry import resolve_target_rule_kinds
 from rulegen.requests import GenerationRequest
@@ -120,7 +120,7 @@ async def _generate_live(
         schema_name = format_metadata.get("name") if isinstance(format_metadata, dict) else None
         phase = (
             "synthesis"
-            if schema_name == "SynthesisResult"
+            if schema_name == "SynthesisResponse"
             else "verification"
             if schema_name == "VerificationResult"
             else "unknown"
@@ -146,7 +146,7 @@ async def _generate_live(
             if validation_phase is not None:
                 try:
                     if validation_phase == "synthesis":
-                        parsed = TypeAdapter(SynthesisResult).validate_json(raw_completion)
+                        parsed = TypeAdapter(SynthesisResponse).validate_json(raw_completion)
                         preflight_check(request)
                         task = request.tasks[0]
                         llm_request = build_llm_generation_payload(
@@ -167,7 +167,7 @@ async def _generate_live(
                             _validate_synthesis_catalog(parsed, llm_request)
                         if isinstance(parsed, NoSafeCandidate):
                             if raw_object is not None:
-                                candidate_explanation = raw_object.get("explanation")
+                                candidate_explanation = parsed.result.explanation
                                 if isinstance(candidate_explanation, str):
                                     explanation = candidate_explanation
                     elif validation_phase == "verification":

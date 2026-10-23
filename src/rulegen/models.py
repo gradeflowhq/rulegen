@@ -19,37 +19,40 @@ MAX_REGENERATION_FAILURE_CODES = 5
 MAX_TEST_RESULT_IDS = 50
 
 
-class BehavioralCaseExpectation(StrictModel):
+class ModelCaseExpectation(StrictModel):
     source_id: BoundedString
     expected_points: NonNegativeFiniteNumber
     reason: BoundedString
 
 
-class BehavioralContract(StrictModel):
-    interpretation: BoundedString
-    case_expectations: list[BehavioralCaseExpectation] = Field(min_length=1, max_length=100)
-    boundary_behaviors: list[BoundedString] = Field(default_factory=list, max_length=20)
-
-    @model_validator(mode="after")
-    def validate_unique_case_expectations(self) -> BehavioralContract:
-        source_ids = [expectation.source_id for expectation in self.case_expectations]
-        if len(source_ids) != len(set(source_ids)):
-            raise ValueError("case_expectations must not contain duplicate source IDs")
-        return self
-
-
-class SynthesisCandidate(StrictModel):
-    """Provider-conforming rule payload; catalog validation stores its engine model.
+class SynthesisCandidatePayload(StrictModel):
+    """Authoring fields for a candidate, after the outcome has been selected.
 
     The rule dictionary does not locally validate the nested authoring schema.
     generate() relies on the provider to enforce that strict request-specific schema.
     """
 
-    outcome: Literal["candidate"]
     summary: BoundedString
     rule: dict[str, Any]
+    model_case_expectations: list[ModelCaseExpectation] = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_unique_model_case_expectations(self) -> SynthesisCandidatePayload:
+        source_ids = [expectation.source_id for expectation in self.model_case_expectations]
+        if len(source_ids) != len(set(source_ids)):
+            raise ValueError("model_case_expectations must not contain duplicate source IDs")
+        return self
+
+
+class SynthesisCandidate(StrictModel):
+    """Outcome-first candidate envelope with a trusted, private hydrated engine rule."""
+
+    # Keep outcome separate from the result fields so the LLM chooses response branch
+    # first. Previously, emitting "explanation" first locked the model into
+    # no_safe_candidate, causing false refusals in live tests.
+    outcome: Literal["candidate"]
+    result: SynthesisCandidatePayload
     _engine_rule: QuestionRule | None = PrivateAttr(default=None)
-    behavioral_contract: BehavioralContract
 
 
 NoSafeCandidateReason: TypeAlias = Literal[
@@ -61,14 +64,13 @@ NoSafeCandidateReason: TypeAlias = Literal[
 ]
 
 
-class NoSafeCandidate(StrictModel):
-    outcome: Literal["no_safe_candidate"]
+class NoSafeCandidatePayload(StrictModel):
     reason_code: NoSafeCandidateReason
     explanation: BoundedString
     teacher_actions: list[BoundedString] = Field(default_factory=list, max_length=MAX_QUESTIONS)
 
     @model_validator(mode="after")
-    def validate_teacher_actions(self) -> NoSafeCandidate:
+    def validate_teacher_actions(self) -> NoSafeCandidatePayload:
         if self.reason_code == "ambiguous_intent" and not self.teacher_actions:
             raise ValueError("ambiguous_intent requires teacher_actions")
         if self.teacher_actions and self.reason_code not in {
@@ -80,7 +82,12 @@ class NoSafeCandidate(StrictModel):
         return self
 
 
-SynthesisResult: TypeAlias = Annotated[
+class NoSafeCandidate(StrictModel):
+    outcome: Literal["no_safe_candidate"]
+    result: NoSafeCandidatePayload
+
+
+SynthesisResponse: TypeAlias = Annotated[
     SynthesisCandidate | NoSafeCandidate,
     Field(discriminator="outcome"),
 ]
@@ -93,10 +100,10 @@ class Verified(StrictModel):
 
 
 VerificationFailureReason: TypeAlias = Literal[
-    "expected_outcome_mismatch",
+    "teacher_label_mismatch",
     "false_positive",
     "false_negative",
-    "partial_credit_mismatch",
+    "model_expectation_mismatch",
     "insufficient_coverage",
     "candidate_execution_failed",
 ]

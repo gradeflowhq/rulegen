@@ -6,8 +6,8 @@ from typing import Any
 import pytest
 from gradeflow_engine.rules.models.number_equal import NumberEqualConfig
 
-from rulegen import LLMGenerationRequest, LLMQuestion, LLMRepresentativeStudentAnswer
-from rulegen.llm_payloads import LLMGroupGenerationRequest, LLMTeacherLabelledExample
+from rulegen import LLMGenerationRequest, LLMQuestion, LLMRepresentativeCase
+from rulegen.llm_payloads import LLMGroupGenerationRequest, LLMTeacherCaseExpectation
 from rulegen.response_schemas import (
     group_synthesis_response_schema,
     synthesis_response_schema,
@@ -17,6 +17,25 @@ from tests.support.authoring import hydrate_single
 from tests.support.schemas import definition, generation_request, resolve, root
 
 # Response envelopes and eligible rule families
+
+
+@pytest.mark.parametrize(
+    "schema_factory", [synthesis_response_schema, group_synthesis_response_schema]
+)
+def test_candidate_schema_contains_direct_model_case_expectations(schema_factory):
+    request = (
+        generation_request(["text_match"]) if schema_factory is synthesis_response_schema else None
+    )
+    schema = schema_factory(request) if request is not None else _group_schema()
+    candidate = schema["$defs"]["SynthesisCandidatePayload"]
+    assert set(candidate["properties"]) == {"summary", "rule", "model_case_expectations"}
+    assert set(candidate["required"]) == {"summary", "rule", "model_case_expectations"}
+    expectations = candidate["properties"]["model_case_expectations"]
+    assert expectations["minItems"] == 1
+    assert expectations["maxItems"] == 100
+    item = resolve(schema, expectations["items"])
+    assert set(item["properties"]) == {"source_id", "expected_points", "reason"}
+    assert "BehavioralContract" not in schema["$defs"]
 
 
 def _single_schema() -> dict[str, Any]:
@@ -29,10 +48,8 @@ def _single_schema() -> dict[str, Any]:
             choice_options={"choice-a": "Alpha", "choice-b": "Beta"},
         ),
         teacher_intent="Use the exact selected choice IDs.",
-        representative_student_answers=[
-            LLMRepresentativeStudentAnswer(
-                source_id="case-1", answers={"q1": ["choice-a"]}, count=1
-            )
+        representative_cases=[
+            LLMRepresentativeCase(source_id="case-1", answers={"q1": ["choice-a"]}, count=1)
         ],
     )
     return synthesis_response_schema(request)
@@ -46,10 +63,8 @@ def _group_schema() -> dict[str, Any]:
         ],
         allowed_rule_kinds=["assumption_set_multi"],
         teacher_intent="Apply the grouped rule.",
-        representative_student_answers=[
-            LLMRepresentativeStudentAnswer(
-                source_id="case-1", answers={"q1": "a", "q2": "b"}, count=1
-            )
+        representative_cases=[
+            LLMRepresentativeCase(source_id="case-1", answers={"q1": "a", "q2": "b"}, count=1)
         ],
     )
     return group_synthesis_response_schema(request)
@@ -60,8 +75,8 @@ def _recursive_single_schema() -> dict[str, Any]:
         allowed_rule_kinds=["composite"],
         question=LLMQuestion(question_id="q1", type="TEXT", max_points=1),
         teacher_intent="Use only compatible nested value rules.",
-        representative_student_answers=[
-            LLMRepresentativeStudentAnswer(source_id="case-1", answers={"q1": "answer"}, count=1)
+        representative_cases=[
+            LLMRepresentativeCase(source_id="case-1", answers={"q1": "answer"}, count=1)
         ],
     )
     return synthesis_response_schema(request)
@@ -73,8 +88,8 @@ def _schema_for(question, kind, answer):
             teacher_intent="Use the specified policy.",
             question=question,
             allowed_rule_kinds=[kind],
-            representative_student_answers=[
-                LLMRepresentativeStudentAnswer(
+            representative_cases=[
+                LLMRepresentativeCase(
                     source_id="case", answers={question.question_id: answer}, count=1
                 )
             ],
@@ -125,7 +140,7 @@ def test_verification_and_no_safe_envelopes_remain_rulegen_owned():
         "regenerate",
     }
     schema = synthesis_response_schema(generation_request(["text_match"]))
-    actions = schema["$defs"]["NoSafeCandidate"]["properties"]["teacher_actions"]
+    actions = schema["$defs"]["NoSafeCandidatePayload"]["properties"]["teacher_actions"]
     assert actions["items"]["type"] == "string"
 
 
@@ -147,7 +162,7 @@ def test_request_schema_uses_the_native_tagged_result_union(schema_factory) -> N
 
 def test_single_choice_restrictions_remain_request_scoped() -> None:
     schema = _single_schema()
-    candidate = schema["$defs"]["SynthesisCandidate"]
+    candidate = schema["$defs"]["SynthesisCandidatePayload"]
     strategy_ref = candidate["properties"]["rule"]["discriminator"]["mapping"]["MULTIPLE_CHOICE"]
     strategy = schema["$defs"][strategy_ref.rsplit("/", 1)[-1]]
     assert strategy["properties"]["answer"]["items"]["enum"] == ["choice-a", "choice-b"]
@@ -178,7 +193,7 @@ def test_group_membership_and_nested_rule_scope_remain_request_scoped() -> None:
 
 def test_recursive_rules_remain_available_and_excluded_families_stay_excluded() -> None:
     schema = _recursive_single_schema()
-    candidate = schema["$defs"]["SynthesisCandidate"]
+    candidate = schema["$defs"]["SynthesisCandidatePayload"]
     union = candidate["properties"]["rule"]
     for _ in range(6):
         composite_ref = union["discriminator"]["mapping"]["COMPOSITE"]
@@ -288,8 +303,8 @@ def test_group_schema_scopes_choice_ids_to_each_question() -> None:
         ],
         allowed_rule_kinds=["assumption_set_multi"],
         teacher_intent="Use the choices.",
-        teacher_labelled_examples=[
-            LLMTeacherLabelledExample(
+        teacher_case_expectations=[
+            LLMTeacherCaseExpectation(
                 source_id="case-1", answers={"q1": ["a"], "q2": ["b"]}, expected_points=2
             )
         ],
@@ -326,7 +341,7 @@ def test_nested_multi_valued_schema_preserves_types_order_and_count():
         "assumption_set",
         [3, "yes"],
     )
-    root = schema["$defs"]["SynthesisCandidate"]["properties"]["rule"]
+    root = schema["$defs"]["SynthesisCandidatePayload"]["properties"]["rule"]
     assumption = resolve(
         schema,
         _definition(schema, root, "assumption_set")["assumptions"]["items"],
@@ -355,7 +370,7 @@ def test_nested_choice_ids_remain_scoped_inside_assumptions():
         "assumption_set",
         ["a"],
     )
-    root = schema["$defs"]["SynthesisCandidate"]["properties"]["rule"]
+    root = schema["$defs"]["SynthesisCandidatePayload"]["properties"]["rule"]
     assumption = resolve(
         schema,
         _definition(schema, root, "assumption_set")["assumptions"]["items"],
@@ -371,7 +386,7 @@ def test_recursive_schema_and_hydration_support_nested_composites():
     schema = _schema_for(
         LLMQuestion(question_id="q", type="TEXT", max_points=1), "composite", "yes"
     )
-    union = schema["$defs"]["SynthesisCandidate"]["properties"]["rule"]
+    union = schema["$defs"]["SynthesisCandidatePayload"]["properties"]["rule"]
     child = _definition(schema, union, "composite")["rules"]["items"]
     assert "TEXT_MATCH" in child["discriminator"]["mapping"]
     rule = hydrate_single(
@@ -384,3 +399,17 @@ def test_recursive_schema_and_hydration_support_nested_composites():
     )
     assert rule.rules[0].rules[0].answers == ["yes"]
     json.dumps(schema)
+
+
+@pytest.mark.parametrize("factory", [_single_schema, _group_schema])
+def test_synthesis_schema_decides_outcome_before_branch_payload(factory) -> None:
+    schema = factory()
+    for name in ("SynthesisCandidate", "NoSafeCandidate"):
+        branch = schema["$defs"][name]
+        assert list(branch["properties"]) == ["outcome", "result"]
+        assert sorted(branch["properties"]) == ["outcome", "result"]
+        assert branch["required"] == ["outcome", "result"]
+        assert branch["additionalProperties"] is False
+        payload = resolve(schema, branch["properties"]["result"])
+        assert "outcome" not in payload["properties"]
+        assert payload["additionalProperties"] is False

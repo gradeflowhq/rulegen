@@ -13,12 +13,12 @@ from rulegen.execution import CandidateTestCase
 from rulegen.llm_payloads import (
     LLMGenerationRequest,
     LLMQuestion,
-    LLMTeacherLabelledExample,
+    LLMTeacherCaseExpectation,
     LLMVerificationRequest,
     VerificationTestResult,
     build_llm_generation_payload,
 )
-from rulegen.models import BehavioralCaseExpectation, BehavioralContract
+from rulegen.models import ModelCaseExpectation
 from rulegen.preflight import preflight_check
 from rulegen.registry import resolve_target_rule_kinds
 from rulegen.requests import GenerationLimits, GenerationRequest
@@ -100,14 +100,11 @@ def verification_request() -> LLMVerificationRequest:
         questions=[LLMQuestion(question_id="q1", type="TEXT", max_points=1)],
         teacher_intent="Accept a concise yes answer.",
         rule={"kind": "text_match"},
-        behavioral_contract=BehavioralContract(
-            interpretation="Accept yes.",
-            case_expectations=[
-                BehavioralCaseExpectation(
-                    source_id="representative-1", expected_points=1, reason="Matches intent."
-                )
-            ],
-        ),
+        model_case_expectations=[
+            ModelCaseExpectation(
+                source_id="representative-1", expected_points=1, reason="Matches intent."
+            )
+        ],
         test_results=[
             VerificationTestResult(
                 test_result_id="representative-1",
@@ -135,11 +132,11 @@ def llm_request() -> LLMGenerationRequest:
             question_id="q1", type="TEXT", max_points=1, description="Name the capital of France."
         ),
         teacher_intent="Accept Paris exactly.",
-        teacher_labelled_examples=[
-            LLMTeacherLabelledExample(
+        teacher_case_expectations=[
+            LLMTeacherCaseExpectation(
                 source_id="positive", answers={"q1": "Paris"}, expected_points=1
             ),
-            LLMTeacherLabelledExample(
+            LLMTeacherCaseExpectation(
                 source_id="negative", answers={"q1": "Lyon"}, expected_points=0
             ),
         ],

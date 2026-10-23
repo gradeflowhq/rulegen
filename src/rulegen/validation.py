@@ -20,9 +20,10 @@ from .authoring import authoring_fields
 from .constraints import MAX_ABS_FLOAT, MAX_SAFE_JSON_INTEGER, MAX_TEXT_LENGTH, MAX_VALUES
 from .llm_payloads import LLMGenerationRequest, LLMGroupGenerationRequest, LLMVerificationRequest
 from .models import (
+    ModelCaseExpectation,
     NoSafeCandidate,
     Regenerate,
-    SynthesisResult,
+    SynthesisResponse,
     VerificationResult,
 )
 
@@ -134,8 +135,11 @@ def _validate_and_hydrate_rule(
     """Hydrate provider-schema-conforming output, then check normalized semantics."""
     from .hydration import hydrate_rule
 
-    rule = hydrate_rule(payload, context)
-    validate_rule(rule, context)
+    try:
+        rule = hydrate_rule(payload, context)
+        validate_rule(rule, context)
+    except CatalogValidationError as exc:
+        raise CatalogValidationError(exc.code, path=f"result.{exc.path}") from None
     return rule
 
 
@@ -234,37 +238,47 @@ def _requires_partial_credit_evidence(value: object) -> bool:
     return False
 
 
-def _validate_synthesis_catalog(output: SynthesisResult, request: LLMGenerationRequest) -> None:
+def _validate_synthesis_catalog(output: SynthesisResponse, request: LLMGenerationRequest) -> None:
     if isinstance(output, NoSafeCandidate):
         return
 
-    rule = _validate_and_hydrate_rule(output.rule, generation_context(request))
+    rule = _validate_and_hydrate_rule(output.result.rule, generation_context(request))
     output._engine_rule = rule
-    if not request.teacher_labelled_examples and _requires_partial_credit_evidence(rule):
-        raise CatalogValidationError("partial_credit_requires_teacher_evidence", path="rule")
+    if not request.teacher_case_expectations and _requires_partial_credit_evidence(rule):
+        raise CatalogValidationError("partial_credit_requires_teacher_evidence", path="result.rule")
 
-    contract_expectations = {
-        expectation.source_id: expectation
-        for expectation in output.behavioral_contract.case_expectations
-    }
     labelled_points = {
-        example.source_id: example.expected_points for example in request.teacher_labelled_examples
+        example.source_id: example.expected_points for example in request.teacher_case_expectations
     }
     disclosed_case_ids = labelled_points.keys() | {
-        representative.source_id for representative in request.representative_student_answers
+        representative.source_id for representative in request.representative_cases
     }
-    if contract_expectations.keys() != disclosed_case_ids:
+    _validate_case_expectations(
+        output.result.model_case_expectations,
+        disclosed_case_ids,
+        labelled_points,
+        request.question.max_points,
+    )
+
+
+def _validate_case_expectations(
+    expectations: Sequence[ModelCaseExpectation],
+    disclosed_case_ids: set[str],
+    teacher_scores: dict[str, float],
+    max_points: float,
+) -> None:
+    if {expectation.source_id for expectation in expectations} != disclosed_case_ids:
         raise CatalogValidationError(
-            "behavioral_contract_case_catalog_mismatch",
-            path="behavioral_contract.case_expectations",
+            "case_expectation_catalog_mismatch",
+            path="result.model_case_expectations",
         )
-    for source_id, expectation in contract_expectations.items():
-        if expectation.expected_points > request.question.max_points:
+    for expectation in expectations:
+        if expectation.expected_points > max_points:
             raise CatalogValidationError(
-                "behavioral_contract_points_exceed_maximum",
-                path="behavioral_contract.case_expectations.expected_points",
+                "case_expectation_points_exceed_maximum",
+                path="result.model_case_expectations.expected_points",
             )
-        trusted_points = labelled_points.get(source_id)
+        trusted_points = teacher_scores.get(expectation.source_id)
         if trusted_points is not None and not math.isclose(
             expectation.expected_points,
             trusted_points,
@@ -272,8 +286,8 @@ def _validate_synthesis_catalog(output: SynthesisResult, request: LLMGenerationR
             abs_tol=1e-9,
         ):
             raise CatalogValidationError(
-                "behavioral_contract_conflicts_with_teacher_label",
-                path="behavioral_contract.case_expectations.expected_points",
+                "case_expectation_conflicts_with_teacher_label",
+                path="result.model_case_expectations.expected_points",
             )
 
 
@@ -289,7 +303,7 @@ def _validate_verification_catalog(
         )
 
 
-def _validate_group_synthesis_catalog(output: SynthesisResult, request: object) -> None:
+def _validate_group_synthesis_catalog(output: SynthesisResponse, request: object) -> None:
     if not isinstance(request, GroupValidationContext):
         raise CatalogValidationError("invalid_group_request", path="request")
     if isinstance(output, NoSafeCandidate):
@@ -304,36 +318,20 @@ def _validate_group_synthesis_catalog(output: SynthesisResult, request: object) 
             }
         ),
     )
-    rule = _validate_and_hydrate_rule(output.rule, context)
+    rule = _validate_and_hydrate_rule(output.result.rule, context)
     output._engine_rule = rule
-    if not llm_request.teacher_labelled_examples and _requires_partial_credit_evidence(rule):
-        raise CatalogValidationError("partial_credit_requires_teacher_evidence", path="rule")
+    if not llm_request.teacher_case_expectations and _requires_partial_credit_evidence(rule):
+        raise CatalogValidationError("partial_credit_requires_teacher_evidence", path="result.rule")
 
-    expected_ids = {item.source_id for item in llm_request.teacher_labelled_examples}
-    expected_ids.update(item.source_id for item in llm_request.representative_student_answers)
-    contract_ids = {item.source_id for item in output.behavioral_contract.case_expectations}
-    if contract_ids != expected_ids:
-        raise CatalogValidationError(
-            "behavioral_contract_case_catalog_mismatch",
-            path="behavioral_contract.case_expectations",
-        )
-    max_points = sum(question.max_points for question in llm_request.questions)
-    labelled = {
-        item.source_id: item.expected_points for item in llm_request.teacher_labelled_examples
+    labelled_points = {
+        item.source_id: item.expected_points for item in llm_request.teacher_case_expectations
     }
-    for expectation in output.behavioral_contract.case_expectations:
-        if expectation.expected_points > max_points:
-            raise CatalogValidationError(
-                "behavioral_contract_points_exceed_maximum",
-                path="behavioral_contract.case_expectations.expected_points",
-            )
-        if expectation.source_id in labelled and not math.isclose(
-            expectation.expected_points,
-            labelled[expectation.source_id],
-            rel_tol=0.0,
-            abs_tol=1e-9,
-        ):
-            raise CatalogValidationError(
-                "behavioral_contract_conflicts_with_teacher_label",
-                path="behavioral_contract.case_expectations.expected_points",
-            )
+    disclosed_case_ids = labelled_points.keys() | {
+        item.source_id for item in llm_request.representative_cases
+    }
+    _validate_case_expectations(
+        output.result.model_case_expectations,
+        disclosed_case_ids,
+        labelled_points,
+        sum(question.max_points for question in llm_request.questions),
+    )

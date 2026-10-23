@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Annotated, Any, TypeAlias, cast
 from gradeflow_engine.questions.models.choice import ChoiceQuestion
 from gradeflow_engine.questions.models.multi_valued import MultiValuedQuestion, MultiValueTypes
 from gradeflow_engine.questions.types import QuestionType
-from pydantic import Field, StrictInt, StrictStr, model_validator
+from pydantic import Field, StrictInt, StrictStr
 
 from .constraints import (
     AnswerText,
@@ -19,7 +19,7 @@ from .constraints import (
     LargeBoundedString,
     StrictModel,
 )
-from .models import BehavioralContract, RegenerationFailure
+from .models import ModelCaseExpectation, RegenerationFailure
 from .registry import MultiQuestionRuleKind, RuleKind
 from .targets import TargetTask
 
@@ -31,16 +31,16 @@ __all__ = [
     "LLMGenerationRequest",
     "LLMGroupGenerationRequest",
     "LLMQuestion",
-    "LLMTeacherLabelledExample",
+    "LLMTeacherCaseExpectation",
     "LLMVerificationRequest",
     "RegenerationContext",
-    "LLMRepresentativeStudentAnswer",
+    "LLMRepresentativeCase",
     "VerificationTestResult",
     "build_llm_generation_payload",
     "llm_answer",
 ]
 
-MAX_LLM_EXAMPLES = 50
+MAX_LLM_CASES = 50
 ChoiceOptionText: TypeAlias = Annotated[StrictStr, Field(max_length=2_000)] | None
 LLMAnswerMap: TypeAlias = Annotated[
     dict[BoundedString, None | AnswerText | FiniteNumber | BoundedAnswerList],
@@ -60,88 +60,63 @@ class LLMQuestion(StrictModel):
     value_types: list[MultiValueTypes] = Field(default_factory=list, max_length=50)
 
 
-class LLMTeacherLabelledExample(StrictModel):
+class LLMTeacherCaseExpectation(StrictModel):
     source_id: BoundedString
     answers: LLMAnswerMap
     expected_points: FiniteNumber = Field(ge=0)
 
 
-class LLMRepresentativeStudentAnswer(StrictModel):
+class LLMRepresentativeCase(StrictModel):
     source_id: BoundedString
     answers: LLMAnswerMap
     count: StrictInt = Field(ge=1)
 
 
 class LLMGenerationRequest(StrictModel):
-    """Identity-free request serialized as the single LLM user message."""
+    """Identity-free projection of a valid, unmodified GenerationRequest.
+
+    Public construction validates disclosure bounds and serialization shape only.
+    TargetEvidence, Target, and GenerationRequest own request business invariants.
+    """
 
     allowed_rule_kinds: list[RuleKind] = Field(min_length=1)
     question: LLMQuestion
     teacher_intent: LargeBoundedString
-    teacher_labelled_examples: list[LLMTeacherLabelledExample] = Field(
-        default_factory=list, max_length=MAX_LLM_EXAMPLES
+    teacher_case_expectations: list[LLMTeacherCaseExpectation] = Field(
+        default_factory=list, max_length=MAX_LLM_CASES
     )
-    representative_student_answers: list[LLMRepresentativeStudentAnswer] = Field(
-        default_factory=list, max_length=MAX_LLM_EXAMPLES
+    representative_cases: list[LLMRepresentativeCase] = Field(
+        default_factory=list, max_length=MAX_LLM_CASES
     )
-
-    @model_validator(mode="after")
-    def validate_examples_and_labels(self) -> LLMGenerationRequest:
-        if not self.teacher_labelled_examples and not self.representative_student_answers:
-            raise ValueError("request requires at least one executable authoring case")
-        source_ids: set[str] = set()
-        for example in self.teacher_labelled_examples:
-            if example.source_id in source_ids:
-                raise ValueError("source IDs must be unique")
-            source_ids.add(example.source_id)
-        for representative in self.representative_student_answers:
-            if representative.source_id in source_ids:
-                raise ValueError("source IDs must be unique")
-            source_ids.add(representative.source_id)
-        return self
 
 
 class LLMGroupGenerationRequest(StrictModel):
-    """Sanitized LLM payload for explicitly supported grouped rule families."""
+    """Grouped projection of a valid, unmodified GenerationRequest.
+
+    Public construction validates disclosure bounds and serialization shape only.
+    TargetEvidence, Target, and GenerationRequest own request business invariants.
+    """
 
     questions: list[LLMQuestion] = Field(min_length=2, max_length=10)
     allowed_rule_kinds: list[MultiQuestionRuleKind] = Field(min_length=1)
     teacher_intent: LargeBoundedString
-    teacher_labelled_examples: list[LLMTeacherLabelledExample] = Field(
-        default_factory=list, max_length=MAX_LLM_EXAMPLES
+    teacher_case_expectations: list[LLMTeacherCaseExpectation] = Field(
+        default_factory=list, max_length=MAX_LLM_CASES
     )
-    representative_student_answers: list[LLMRepresentativeStudentAnswer] = Field(
-        default_factory=list, max_length=MAX_LLM_EXAMPLES
+    representative_cases: list[LLMRepresentativeCase] = Field(
+        default_factory=list, max_length=MAX_LLM_CASES
     )
 
     @property
     def question_ids(self) -> list[str]:
         return [question.question_id for question in self.questions]
 
-    @model_validator(mode="after")
-    def validate_group(self) -> LLMGroupGenerationRequest:
-        question_ids = self.question_ids
-        if len(question_ids) != len(set(question_ids)):
-            raise ValueError("question_ids must be unique")
-        if not self.teacher_labelled_examples and not self.representative_student_answers:
-            raise ValueError("request requires at least one executable authoring case")
-        source_ids: set[str] = set()
-        for example in self.teacher_labelled_examples:
-            if example.source_id in source_ids:
-                raise ValueError("source IDs must be unique")
-            source_ids.add(example.source_id)
-        for representative in self.representative_student_answers:
-            if representative.source_id in source_ids:
-                raise ValueError("source IDs must be unique")
-            source_ids.add(representative.source_id)
-        return self
-
 
 class VerificationTestResult(StrictModel):
     """Transport observed execution with an optional authoritative teacher score.
 
     ``expected_points`` serializes a TargetLabelledCase score, or is None for
-    representative evidence. Model expectations live in the behavioral contract.
+    representative evidence. Model predictions remain separate in ``model_case_expectations``.
     """
 
     test_result_id: BoundedString
@@ -160,17 +135,19 @@ class LLMVerificationRequest(StrictModel):
     teacher_intent: LargeBoundedString
     rule: dict[str, Any]
     questions: list[LLMQuestion] = Field(min_length=1, max_length=10)
-    behavioral_contract: BehavioralContract
+    model_case_expectations: list[ModelCaseExpectation] = Field(min_length=1, max_length=100)
     test_results: list[VerificationTestResult] = Field(min_length=1, max_length=100)
-    mismatch_test_result_ids: list[BoundedString] = Field(default_factory=list, max_length=50)
-    contract_mismatch_test_result_ids: list[BoundedString] = Field(
+    teacher_label_mismatch_test_result_ids: list[BoundedString] = Field(
+        default_factory=list, max_length=50
+    )
+    model_expectation_mismatch_test_result_ids: list[BoundedString] = Field(
         default_factory=list, max_length=50
     )
 
 
 class RegenerationContext(StrictModel):
     rule: dict[str, Any]
-    behavioral_contract: BehavioralContract
+    model_case_expectations: list[ModelCaseExpectation] = Field(min_length=1, max_length=100)
     failure: RegenerationFailure
     cited_test_results: list[VerificationTestResult] = Field(default_factory=list, max_length=50)
 
@@ -230,8 +207,8 @@ def build_llm_generation_payload(
             teacher_intent=request.teacher_intent,
             questions=questions,
             allowed_rule_kinds=cast(list[MultiQuestionRuleKind], list(resolved_rule_kinds)),
-            teacher_labelled_examples=[
-                LLMTeacherLabelledExample(
+            teacher_case_expectations=[
+                LLMTeacherCaseExpectation(
                     source_id=item.case_id,
                     answers={
                         qid: llm_answer(answers[item.case_id][qid])
@@ -241,8 +218,8 @@ def build_llm_generation_payload(
                 )
                 for item in evidence.labelled_cases
             ],
-            representative_student_answers=[
-                LLMRepresentativeStudentAnswer(
+            representative_cases=[
+                LLMRepresentativeCase(
                     source_id=item.case_id,
                     answers={
                         qid: llm_answer(answers[item.case_id][qid])
@@ -257,8 +234,8 @@ def build_llm_generation_payload(
         teacher_intent=request.teacher_intent,
         question=questions[0],
         allowed_rule_kinds=cast(list[RuleKind], list(resolved_rule_kinds)),
-        teacher_labelled_examples=[
-            LLMTeacherLabelledExample(
+        teacher_case_expectations=[
+            LLMTeacherCaseExpectation(
                 source_id=item.case_id,
                 answers={
                     task.target.question_ids[0]: llm_answer(
@@ -269,8 +246,8 @@ def build_llm_generation_payload(
             )
             for item in evidence.labelled_cases
         ],
-        representative_student_answers=[
-            LLMRepresentativeStudentAnswer(
+        representative_cases=[
+            LLMRepresentativeCase(
                 source_id=item.case_id,
                 answers={
                     task.target.question_ids[0]: llm_answer(

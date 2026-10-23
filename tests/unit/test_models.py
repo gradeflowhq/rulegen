@@ -7,59 +7,79 @@ import pytest
 from pydantic import TypeAdapter, ValidationError
 
 from rulegen.models import (
-    BehavioralCaseExpectation,
-    BehavioralContract,
+    ModelCaseExpectation,
     NoSafeCandidate,
     Regenerate,
     RegenerationFailure,
     SynthesisCandidate,
-    SynthesisResult,
+    SynthesisResponse,
     VerificationResult,
 )
 
 # Canonical synthesis result parsing
 
 
-def _behavioral_contract() -> dict[str, object]:
-    return {
-        "interpretation": "Accept the supported reference answer and reject the negative case.",
-        "case_expectations": [
-            {"source_id": "ref-1", "expected_points": 1, "reason": "Supported answer."},
-            {"source_id": "ref-2", "expected_points": 0, "reason": "Unsupported answer."},
-        ],
-    }
+def _model_case_expectations() -> list[dict[str, object]]:
+    return [
+        {"source_id": "ref-1", "expected_points": 1, "reason": "Supported answer."},
+        {"source_id": "ref-2", "expected_points": 0, "reason": "Unsupported answer."},
+    ]
 
 
-def _candidate_payload() -> dict[str, object]:
+def _candidate_payload() -> dict[str, Any]:
     return {
         "outcome": "candidate",
-        "summary": "Accept Paris exactly.",
-        "rule": {"type": "TEXT_MATCH", "answers": ["Paris"]},
-        "behavioral_contract": _behavioral_contract(),
-    }
-
-
-def _request_scoped_response_schemas_candidate_payload() -> dict[str, Any]:
-    return {
-        "summary": "Use the exact supported answer.",
-        "rule": {"type": "TEXT_MATCH", "answers": ["answer"]},
-        "behavioral_contract": {
-            "interpretation": "Accept the exact answer.",
-            "case_expectations": [
-                {"source_id": "case-1", "expected_points": 1, "reason": "It matches."}
-            ],
+        "result": {
+            "summary": "Accept Paris exactly.",
+            "rule": {"type": "TEXT_MATCH", "answers": ["Paris"]},
+            "model_case_expectations": _model_case_expectations(),
         },
     }
 
 
-def test_candidate_result_parses_in_its_canonical_shape() -> None:
-    parsed = TypeAdapter(SynthesisResult).validate_json(
-        json.dumps({"outcome": "candidate", **_request_scoped_response_schemas_candidate_payload()})
-    )
-    assert isinstance(parsed, SynthesisCandidate)
-    assert parsed.outcome == "candidate"
-    assert parsed.summary == "Use the exact supported answer."
-    assert parsed.rule["type"] == "TEXT_MATCH"
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        _candidate_payload(),
+        {
+            "outcome": "no_safe_candidate",
+            "result": {
+                "reason_code": "unsupported_rule",
+                "explanation": "The required behavior is unavailable.",
+            },
+        },
+        {
+            "outcome": "no_safe_candidate",
+            "result": {
+                "reason_code": "ambiguous_intent",
+                "explanation": "The numeric policy is ambiguous.",
+                "teacher_actions": [
+                    "Specify numeric tolerance.",
+                    "Clarify whether rounding is allowed.",
+                ],
+            },
+        },
+    ],
+    ids=["candidate", "no-safe-default-actions", "no-safe-multiple-actions"],
+)
+def test_synthesis_response_parses_and_round_trips(envelope: dict[str, Any]) -> None:
+    adapter = TypeAdapter(SynthesisResponse)
+    parsed = adapter.validate_json(json.dumps(envelope))
+    assert parsed.model_dump(exclude_unset=True) == envelope
+    assert adapter.validate_python(dict(reversed(envelope.items()))) == parsed
+    assert "_engine_rule" not in parsed.model_dump()
+    if isinstance(parsed, SynthesisCandidate):
+        assert all(
+            isinstance(expectation, ModelCaseExpectation)
+            for expectation in parsed.result.model_case_expectations
+        )
+        assert [item.source_id for item in parsed.result.model_case_expectations] == [
+            "ref-1",
+            "ref-2",
+        ]
+    else:
+        assert isinstance(parsed, NoSafeCandidate)
+        assert parsed.result.teacher_actions == envelope["result"].get("teacher_actions", [])
 
 
 @pytest.mark.parametrize(
@@ -73,123 +93,33 @@ def test_candidate_result_parses_in_its_canonical_shape() -> None:
 def test_outer_response_model_does_not_validate_nested_authoring_schema(rule) -> None:
     payload = {
         "outcome": "candidate",
-        **_request_scoped_response_schemas_candidate_payload(),
-        "rule": rule,
+        "result": {**_candidate_payload()["result"], "rule": rule},
     }
-    parsed = TypeAdapter(SynthesisResult).validate_json(json.dumps(payload))
+    parsed = TypeAdapter(SynthesisResponse).validate_json(json.dumps(payload))
     assert isinstance(parsed, SynthesisCandidate)
-    assert parsed.rule == rule
+    assert parsed.result.rule == rule
     assert parsed._engine_rule is None
 
 
-@pytest.mark.parametrize(
-    ("reason_code", "teacher_actions"),
-    [("unsupported_rule", None), ("ambiguous_intent", ["Clarify the partial-credit amount."])],
-)
-def test_legitimate_no_safe_results_keep_canonical_behavior(
-    reason_code: str, teacher_actions: list[str] | None
-) -> None:
-    payload: dict[str, Any] = {
-        "reason_code": reason_code,
-        "explanation": "The supplied policy cannot yet produce a safe result.",
-    }
-    if teacher_actions is not None:
-        payload["teacher_actions"] = teacher_actions
-    parsed = TypeAdapter(SynthesisResult).validate_json(
-        json.dumps({"outcome": "no_safe_candidate", **payload})
-    )
-    assert isinstance(parsed, NoSafeCandidate)
-    assert parsed.reason_code == reason_code
-    assert parsed.teacher_actions == (teacher_actions or [])
-
-
-@pytest.mark.parametrize(
-    "result",
-    [
-        {"outcome": "candidate"},
-        {"outcome": "candidate", "summary": None, "rule": None, "behavioral_contract": None},
-        "[]",
-        {
-            "outcome": "candidate",
-            **_request_scoped_response_schemas_candidate_payload(),
-            "extra": True,
-        },
-        {"outcome": "future_outcome"},
-        {**_request_scoped_response_schemas_candidate_payload(), "outcome": "no_safe_candidate"},
-        {
-            "outcome": "candidate",
-            **_request_scoped_response_schemas_candidate_payload(),
-            "unknown_field": True,
-        },
-    ],
-    ids=[
-        "missing-fields",
-        "invalid-fields",
-        "non-object-result",
-        "extra-field",
-        "unknown-outcome",
-        "mismatched-branch",
-        "forbidden-nested-field",
-    ],
-)
-def test_malformed_synthesis_results_are_rejected(result: dict[str, Any] | str) -> None:
-    with pytest.raises(ValidationError):
-        raw_result = result if isinstance(result, str) else json.dumps(result)
-        TypeAdapter(SynthesisResult).validate_json(raw_result)
-
-
-# Response contracts
-
-
-def test_synthesis_result_parses_candidate_json_and_rejects_unknown_fields() -> None:
-    payload = {
-        "outcome": "candidate",
-        "summary": "Accept the supplied labelled answer exactly.",
-        "rule": {"type": "TEXT_MATCH", "answers": ["Paris"]},
-        "behavioral_contract": _behavioral_contract(),
-    }
-    adapter = TypeAdapter(SynthesisResult)
-    parsed = adapter.validate_json(json.dumps(payload))
-    assert isinstance(parsed, SynthesisCandidate)
-    payload["alternative_rule_families_considered"] = ["keywords"]
-    with pytest.raises(ValidationError):
-        adapter.validate_json(json.dumps(payload))
-
-
-def test_canonical_result_parses_no_safe_candidate_and_rejects_invalid_discriminators() -> None:
-    adapter = TypeAdapter(SynthesisResult)
-    parsed = adapter.validate_python(
-        {
-            "outcome": "no_safe_candidate",
-            "reason_code": "insufficient_evidence",
-            "explanation": "There is not enough evidence.",
-        }
-    )
-    assert isinstance(parsed, NoSafeCandidate)
-    invalid_outcome = _candidate_payload()
-    invalid_outcome["outcome"] = "unknown_outcome"
-    with pytest.raises(ValidationError):
-        adapter.validate_python(invalid_outcome)
-
-
-def test_behavioral_contract_parses_structured_case_expectations() -> None:
-    parsed = BehavioralContract.model_validate(_behavioral_contract())
-    assert parsed.interpretation.startswith("Accept the supported")
-    assert all(
-        isinstance(expectation, BehavioralCaseExpectation)
-        for expectation in parsed.case_expectations
-    )
-    assert [item.source_id for item in parsed.case_expectations] == ["ref-1", "ref-2"]
-
-
-def test_behavioral_contract_rejects_duplicate_case_expectations() -> None:
-    payload = _behavioral_contract()
-    payload["case_expectations"] = [
+def test_model_case_expectations_rejects_duplicates() -> None:
+    payload = _candidate_payload()["result"]
+    payload["model_case_expectations"] = [
         {"source_id": "same", "expected_points": 1, "reason": "First."},
         {"source_id": "same", "expected_points": 0, "reason": "Duplicate."},
     ]
     with pytest.raises(ValidationError):
-        BehavioralContract.model_validate(payload)
+        SynthesisCandidate.model_validate({"outcome": "candidate", "result": payload})
+
+
+def test_candidate_rejects_removed_behavioral_contract_schema() -> None:
+    payload = _candidate_payload()
+    payload["result"]["behavioral_contract"] = {
+        "interpretation": "Accept Paris.",
+        "boundary_behaviors": [],
+        "model_case_expectations": payload["result"].pop("model_case_expectations"),
+    }
+    with pytest.raises(ValidationError):
+        SynthesisCandidate.model_validate(payload)
 
 
 @pytest.mark.parametrize(
@@ -214,21 +144,6 @@ def test_verified_branch_cannot_claim_a_mismatch() -> None:
         TypeAdapter(VerificationResult).validate_python(
             {"outcome": "verified", "outcomes_match_intent": False, "caveats": []}
         )
-
-
-def test_no_safe_candidate_accepts_multiple_teacher_action_prompts() -> None:
-    parsed = NoSafeCandidate.model_validate(
-        {
-            "outcome": "no_safe_candidate",
-            "reason_code": "ambiguous_intent",
-            "explanation": "The numeric policy is ambiguous.",
-            "teacher_actions": [
-                "Revise the teacher intent to specify numeric tolerance.",
-                "Clarify whether rounding is allowed in the teacher intent.",
-            ],
-        }
-    )
-    assert len(parsed.teacher_actions) == 2
 
 
 def test_semantic_regeneration_may_cite_zero_test_results() -> None:
@@ -262,3 +177,73 @@ def test_generate_group_does_not_allow_verifier_clarification() -> None:
         TypeAdapter(VerificationResult).validate_python(
             {"outcome": "needs_teacher_action", "question_id": "policy-1"}
         )
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        [],
+        {"outcome": "candidate"},
+        {
+            "outcome": "candidate",
+            "result": {"summary": None, "rule": None, "model_case_expectations": None},
+        },
+        {"outcome": "future_outcome", "result": _candidate_payload()["result"]},
+        {"outcome": "candidate", "result": None},
+        {"outcome": "candidate", "result": []},
+        {
+            "outcome": "candidate",
+            "result": _candidate_payload()["result"],
+            "extra": True,
+        },
+        {
+            "outcome": "candidate",
+            "result": {**_candidate_payload()["result"], "extra": True},
+        },
+        {
+            "outcome": "candidate",
+            "result": {
+                "outcome": "candidate",
+                "result": _candidate_payload()["result"],
+            },
+        },
+        {
+            "outcome": "candidate",
+            "result": {"reason_code": "unsupported_rule", "explanation": "Unavailable."},
+        },
+        {
+            "outcome": "no_safe_candidate",
+            "result": _candidate_payload()["result"],
+        },
+        {
+            "outcome": "no_safe_candidate",
+            "result": {"reason_code": "ambiguous_intent", "explanation": "Unclear."},
+        },
+        {
+            "outcome": "no_safe_candidate",
+            "result": {
+                "reason_code": "unsupported_rule",
+                "explanation": "Unavailable.",
+                "teacher_actions": ["Change policy."],
+            },
+        },
+    ],
+    ids=[
+        "non-object-response",
+        "missing-result",
+        "invalid-result-fields",
+        "unknown-outcome",
+        "null-result",
+        "non-object-result",
+        "extra-envelope-field",
+        "extra-result-field",
+        "nested-envelope",
+        "no-safe-result-in-candidate",
+        "candidate-result-in-no-safe",
+        "ambiguous-intent-without-actions",
+        "unsupported-rule-with-actions",
+    ],
+)
+def test_synthesis_rejects_invalid_envelopes(envelope: dict[str, Any] | list[Any]) -> None:
+    with pytest.raises(ValidationError):
+        TypeAdapter(SynthesisResponse).validate_json(json.dumps(envelope))

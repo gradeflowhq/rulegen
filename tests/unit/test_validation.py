@@ -11,8 +11,9 @@ from pydantic import TypeAdapter, ValidationError
 from rulegen.constraints import MAX_SAFE_JSON_INTEGER, MAX_TEXT_LENGTH, MAX_VALUES
 from rulegen.evidence import TargetEvidence, TargetLabelledCase
 from rulegen.execution import CandidateTestCase
+from rulegen.generator import _prepare_jobs
 from rulegen.llm_payloads import build_llm_generation_payload
-from rulegen.models import SynthesisResult
+from rulegen.models import SynthesisResponse
 from rulegen.preflight import preflight_check
 from rulegen.registry import resolve_target_rule_kinds
 from rulegen.requests import GenerationRequest
@@ -21,11 +22,108 @@ from rulegen.validation import (
     CatalogValidationError,
     GroupValidationContext,
     _validate_group_synthesis_catalog,
+    _validate_synthesis_catalog,
 )
 from tests.support.authoring import TEXT, hydrate_group, hydrate_single
+from tests.support.completion import _model_case_expectations, _request, _synthesis
 from tests.support.requests import group_request, group_strategy
 
 # Validation
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize(
+    ("problem", "code"),
+    [
+        ("missing", "case_expectation_catalog_mismatch"),
+        ("extra", "case_expectation_catalog_mismatch"),
+        ("duplicate", "duplicate source IDs"),
+        ("negative", "greater than or equal to 0"),
+        ("nonfinite", "finite"),
+        ("above_max", "case_expectation_points_exceed_maximum"),
+        ("teacher_conflict", "case_expectation_conflicts_with_teacher_label"),
+    ],
+)
+def test_direct_model_case_expectations_validate_coverage_scores_and_labels(grouped, problem, code):
+    request = group_request() if grouped else _request()
+    if grouped:
+        data = request.model_dump()
+        data["cases"] = (
+            *request.cases,
+            CandidateTestCase(case_id="representative", answer_map={"q1": "x", "q2": "x"}),
+        )
+        data["tasks"][0]["evidence"]["representative_cases"] = [
+            {"case_id": "representative", "count": 1}
+        ]
+        request = GenerationRequest.model_validate(data)
+        payload = {
+            "outcome": "candidate",
+            "result": {
+                "summary": "Award both correct answers.",
+                "rule": group_strategy(),
+                "model_case_expectations": _model_case_expectations(
+                    [("case-1", 2), ("representative", 0)]
+                ),
+            },
+        }
+    else:
+        payload = _synthesis(["Paris"])
+    expectations = payload["result"]["model_case_expectations"]
+    if problem == "missing":
+        expectations.pop()
+    elif problem in {"extra", "duplicate"}:
+        expectations.append(
+            {
+                "source_id": "fabricated" if problem == "extra" else expectations[0]["source_id"],
+                "expected_points": 0,
+                "reason": "An invalid additional case.",
+            }
+        )
+    else:
+        expectations[0]["expected_points"] = {
+            "negative": -1,
+            "nonfinite": math.inf,
+            "above_max": 3,
+            "teacher_conflict": 0,
+        }[problem]
+    with pytest.raises((ValidationError, CatalogValidationError), match=code) as error:
+        output = TypeAdapter(SynthesisResponse).validate_python(payload)
+        job = _prepare_jobs(request)[0][1]
+        if grouped:
+            _validate_group_synthesis_catalog(
+                output,
+                GroupValidationContext(llm_request=job.llm_request, question_set=job.question_set),
+            )
+        else:
+            _validate_synthesis_catalog(output, job.llm_request)
+    if isinstance(error.value, CatalogValidationError):
+        assert error.value.path.startswith("result.model_case_expectations")
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+def test_model_case_expectations_preserve_teacher_label_comparison_tolerance(grouped):
+    request = group_request() if grouped else _request()
+    payload = (
+        {
+            "outcome": "candidate",
+            "result": {
+                "summary": "Award both correct answers.",
+                "rule": group_strategy(),
+                "model_case_expectations": _model_case_expectations([("case-1", 2 - 5e-10)]),
+            },
+        }
+        if grouped
+        else _synthesis(["Paris"], expectations=[("positive", 1 - 5e-10), ("negative", 0)])
+    )
+    output = TypeAdapter(SynthesisResponse).validate_python(payload)
+    job = _prepare_jobs(request)[0][1]
+    if grouped:
+        _validate_group_synthesis_catalog(
+            output,
+            GroupValidationContext(llm_request=job.llm_request, question_set=job.question_set),
+        )
+    else:
+        _validate_synthesis_catalog(output, job.llm_request)
 
 
 def test_group_catalog_rejects_unknown_nested_choice_id() -> None:
@@ -64,36 +162,37 @@ def test_group_catalog_rejects_unknown_nested_choice_id() -> None:
     )
     payload = {
         "outcome": "candidate",
-        "summary": "choices",
-        "rule": {
-            "type": "ASSUMPTION_SET_MULTI",
-            "assumptions": [
-                {
-                    "rules": [
-                        {
-                            "question_id": "q1",
-                            "type": "MULTIPLE_CHOICE",
-                            "answer": ["unknown"],
-                            "mode": "ALL",
-                        },
-                        {
-                            "question_id": "q2",
-                            "type": "MULTIPLE_CHOICE",
-                            "answer": ["b"],
-                            "mode": "ALL",
-                        },
-                    ]
-                }
+        "result": {
+            "summary": "choices",
+            "rule": {
+                "type": "ASSUMPTION_SET_MULTI",
+                "assumptions": [
+                    {
+                        "rules": [
+                            {
+                                "question_id": "q1",
+                                "type": "MULTIPLE_CHOICE",
+                                "answer": ["unknown"],
+                                "mode": "ALL",
+                            },
+                            {
+                                "question_id": "q2",
+                                "type": "MULTIPLE_CHOICE",
+                                "answer": ["b"],
+                                "mode": "ALL",
+                            },
+                        ]
+                    }
+                ],
+            },
+            "model_case_expectations": [
+                {"source_id": "case-1", "expected_points": 2, "reason": "case"}
             ],
-        },
-        "behavioral_contract": {
-            "interpretation": "choices",
-            "case_expectations": [{"source_id": "case-1", "expected_points": 2, "reason": "case"}],
         },
     }
     with pytest.raises(CatalogValidationError, match="unknown_choice_id"):
         _validate_group_synthesis_catalog(
-            TypeAdapter(SynthesisResult).validate_python(payload), context
+            TypeAdapter(SynthesisResponse).validate_python(payload), context
         )
 
 

@@ -5,10 +5,10 @@ RuleGen is the rule-authoring component for GradeFlow. It turns a question set, 
 ## Highlights
 
 - Asynchronous provider calls through the LiteLLM Python SDK (`litellm.acompletion`).
-- Teacher instructions as the primary input, with labelled examples and representative answers.
+- Teacher instructions as the primary input, with teacher case expectations and representative cases.
 - Trusted hydration of engine-shaped LLM responses into GradeFlow engine rule models.
 - RuleGen prepares candidates and test cases using engine rubric validation and grading.
-- Bounded retries, regeneration, token accounting, and proposal counts. [WIP]
+- Bounded retries, regeneration, and token accounting for one evolving candidate per target.
 - Validation diagnostics, source evidence, and hydrated candidate identities.
 - SoC-LaaS access through LiteLLM’s OpenAI-compatible provider support.
 
@@ -26,15 +26,19 @@ LiteLLM owns provider selection and HTTP transport. RuleGen owns prompts, strict
 
 ## Generation workflow
 
+Each target has one evolving candidate and a private conversation that continues through generation, verification, regeneration, and format retries. History lives only in memory during that target's run. Every target, later request, and concurrent invocation starts fresh, including when reusing a `RuleGenerator` instance.
+
+Each phase’s user turn carries only that phase’s instructions before the untrusted JSON request payload; regeneration reuses generation instructions. Accepted turns are replayed verbatim. Each user turn identifies generation, verification, or regeneration and contains the active response schema and relevant inputs or feedback. Accepted user turns and validated assistant JSON, including verification verdicts, remain in history. The original teacher request is preserved without summarization or silent truncation. Malformed, catalog-invalid, and truncated replies are excluded; format retries start from the preceding accepted history with bounded diagnostics.
+
 For a single-question request, `RuleGenerator.generate()` follows these stages:
 
 1. **Request preparation and preflight:** use the supplied `GenerationRequest` directly and run `preflight_check()` on its question context, targets, and evidence. Resolve compatible rule families and build the sanitized LLM payload and target-scoped execution cases.
-2. **Synthesis:** ask the LLM for an engine-shaped candidate rule and `BehavioralContract`, using a strict authoring schema derived from the engine models. The schema exposes only whitelisted grading fields and removes engine-owned fields such as `id`, `scope`, `display_name`, `question_types`, and `constraints` to prevent the LLM from inventing rule identities or overriding engine compatibility and validation metadata. A `NoSafeCandidate` response ends generation with `no_safe_candidate` or `needs_teacher_action`.
+2. **Synthesis:** require `{outcome, result}`: candidates include a summary, rule, and direct `model_case_expectations`. The rule generated uses an engine-derived schema limited to whitelisted grading fields. Refusals and inability to generate a rule include a reason, explanation, and optional teacher actions.
 3. **Response validation and hydration:** validate the synthesis response and catalog references. Rely on provider enforcement of the authoring schema, hydrate trusted fields through the original engine Pydantic model, and validate normalized semantic and contextual constraints. Invalid synthesis or verification responses may receive a bounded format retry.
-4. **Candidate execution:** use `execute_candidate_rule()` to validate the prospective rubric and grade only the supplied target-scoped cases, including teacher-labelled examples and representative answers.
-5. **Local behavioural checks:** compare execution results with authoritative teacher labels and the model's `BehavioralContract`. Detect score mismatches before calling the verifier.
-6. **Model-based verification:** send the candidate, behavioural contract, and execution results to the LLM verifier. It returns `Verified` or `Regenerate`.
-7. **Bounded regeneration:** candidate validation or execution failures, local behavioural mismatches, and `Regenerate` responses feed correction guidance into another synthesis attempt. Format retries and regeneration share the target's LLM-call and reported-token budgets.
+4. **Candidate execution:** use `execute_candidate_rule()` to validate the prospective rubric and grade only the supplied target-scoped cases, including teacher case expectations and representative cases.
+5. **Local behavioural checks:** compare execution results with authoritative teacher case expectations and the model's case expectations. Detect score mismatches before calling the verifier.
+6. **Model-based verification:** send the normalized candidate (including engine defaults), model case expectations, and bounded execution results to the LLM verifier in the same conversation. Verification assesses the rule and observed behavior against original teacher intent; summaries and case reasons never replace that intent. It returns `Verified` or `Regenerate`.
+7. **Bounded regeneration:** candidate validation or execution failures, local behavioural mismatches, and `Regenerate` responses feed correction guidance into another synthesis attempt. Deterministic failures go directly to regeneration; otherwise the verifier must return `verified` or `regenerate`. Every revised candidate is executed and explicitly verified again. Representative expected scores may change only with a revised case reason explaining the correction against teacher intent; teacher-labelled scores remain fixed. Format retries and regeneration share the target's LLM-call and reported-token budgets.
 8. **Result:** return a `RuleGenerationResult` with a candidate only when its status is `verified`. Other outcomes are `needs_teacher_action`, `no_safe_candidate`, or `unresolved`, with applicable reasons and diagnostics.
 
 `generate_group()` uses the same stages for one explicitly declared group. `generate_mixed()` prepares and preflights all ordered targets before the first LLM call, then runs each target sequentially with its own limits. Both preserve the declared question order and group boundaries.
@@ -66,9 +70,9 @@ verified RuleGenerationResult.candidate
 
 ## Budget handling
 
-Each request carries `GenerationLimits` to keep LLM usage predictable. The limits cap LLM calls (`max_llm_calls`), reported total tokens, format retries, regeneration attempts, and returned proposals. The default configuration allows one format retry, one regeneration attempt, ten LLM calls, 30,000 reported tokens, and one proposal. In a mixed request these limits apply independently to each target; there is no shared mixed-request budget.
+Each request carries `GenerationLimits` to keep LLM usage predictable. The limits cap LLM calls (`max_llm_calls`), reported total tokens, format retries, and regeneration attempts. The default configuration allows one format retry, one regeneration attempt, ten LLM calls, and 30,000 reported tokens. Each target returns at most one verified candidate. In a mixed request these limits apply independently to each target; there is no shared mixed-request budget.
 
-The limits are shared across the generation and verification workflow. A failed attempt, retry, or regeneration still consumes the relevant call and token budget. When a limit is reached, RuleGen stops making LLM calls and returns the work completed so far with an unresolved budget outcome and validation diagnostics.
+The limits are shared across the generation and verification workflow. A failed attempt, retry, or regeneration still consumes the relevant call and token budget. Replayed conversation history counts toward reported tokens on every call; history is never silently truncated to fit a budget. When a limit is reached, RuleGen stops making LLM calls and returns the work completed so far with an unresolved budget outcome and validation diagnostics.
 
 ### Supported rule models and nesting
 
@@ -188,7 +192,7 @@ RuleGen's Pydantic response schemas avoid provider-unsupported JSON Schema keywo
 | `pyproject.toml` | Package metadata, dependencies, and development-tool configuration |
 | `.env.example` | Example environment variable names for local provider configuration |
 
-Fractional grading policies require teacher-labelled evidence. Rulegen checks this recursively before execution for PARTIAL modes and assumption weights strictly between zero and one, including grouped branches; a model-written behavioral contract is not teacher evidence.
+Fractional grading policies require teacher-labelled evidence. Rulegen checks this recursively before execution for PARTIAL modes and assumption weights strictly between zero and one, including grouped branches; a model case expectation is not teacher evidence.
 
 ## Unit test organization
 
