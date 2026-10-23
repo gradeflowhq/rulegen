@@ -36,7 +36,7 @@ def _workflow_request() -> GenerationRequest:
         teacher_intent=teacher_intent,
         tasks=(
             TargetTask(
-                target=Target(question_ids=["live-mcq"], allowed_rule_kinds=["multiple_choice"]),
+                target=Target(question_ids=["live-mcq"], allowed_rule_kinds=["MULTIPLE_CHOICE"]),
                 evidence=TargetEvidence(
                     labelled_cases=[],
                     representative_cases=[

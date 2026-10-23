@@ -28,13 +28,13 @@ LiteLLM owns provider selection and HTTP transport. RuleGen owns prompts, strict
 
 Each target has one evolving candidate and a private conversation that continues through generation, verification, regeneration, and format retries. History lives only in memory during that target's run. Every target, later request, and concurrent invocation starts fresh, including when reusing a `RuleGenerator` instance.
 
-Each phase’s user turn carries only that phase’s instructions before the untrusted JSON request payload; regeneration reuses generation instructions. Accepted turns are replayed verbatim. Each user turn identifies generation, verification, or regeneration and contains the active response schema and relevant inputs or feedback. Accepted user turns and validated assistant JSON, including verification verdicts, remain in history. The original teacher request is preserved without summarization or silent truncation. Malformed, catalog-invalid, and truncated replies are excluded; format retries start from the preceding accepted history with bounded diagnostics.
+Each phase’s user turn carries only that phase’s instructions before the untrusted JSON request payload; regeneration reuses generation instructions. Accepted turns are replayed verbatim. Each user turn identifies generation, verification, or regeneration and contains the active response schema and relevant inputs or feedback. Accepted user turns and validated assistant JSON, including verification verdicts, remain in history. The original teacher request is preserved without summarization or silent truncation. Malformed and truncated replies are excluded; format retries start from the preceding accepted history with bounded diagnostics.
 
 For a single-question request, `RuleGenerator.generate()` follows these stages:
 
 1. **Request preparation and preflight:** use the supplied `GenerationRequest` directly and run `preflight_check()` on its question context, targets, and evidence. Resolve compatible rule families and build the sanitized LLM payload and target-scoped execution cases.
-2. **Synthesis:** require `{outcome, result}`: candidates include a summary, rule, and direct `model_case_expectations`. The rule generated uses an engine-derived schema limited to whitelisted grading fields. Refusals and inability to generate a rule include a reason, explanation, and optional teacher actions.
-3. **Response validation and hydration:** validate the synthesis response and catalog references. Rely on provider enforcement of the authoring schema, hydrate trusted fields through the original engine Pydantic model, and validate normalized semantic and contextual constraints. Invalid synthesis or verification responses may receive a bounded format retry.
+2. **Synthesis:** require `{outcome, result}`: candidates include a summary, rule, and direct `model_case_expectations`. The rule generated uses an engine-derived schema that excludes protected metadata and blocked rule families. Refusals and inability to generate a rule include a reason, explanation, and optional teacher actions.
+3. **Response validation and hydration:** validate the response envelope, then hydrate trusted fields without local authoring-policy or declared-group membership checks. The strict provider schema enforces allowed rule families and authoring fields. Engine models are parsed before execution; parsing failures use bounded candidate regeneration. Invalid synthesis or verification envelopes may receive a bounded format retry.
 4. **Candidate execution:** use `execute_candidate_rule()` to validate the prospective rubric and grade only the supplied target-scoped cases, including teacher case expectations and representative cases.
 5. **Local behavioural checks:** compare execution results with authoritative teacher case expectations and the model's case expectations. Detect score mismatches before calling the verifier.
 6. **Model-based verification:** send the normalized candidate (including engine defaults), model case expectations, and bounded execution results to the LLM verifier in the same conversation. Verification assesses the rule and observed behavior against original teacher intent; summaries and case reasons never replace that intent. It returns `Verified` or `Regenerate`.
@@ -76,10 +76,12 @@ The limits are shared across the generation and verification workflow. A failed 
 
 ### Supported rule models and nesting
 
-Supported families:
+Families are discovered from compatible engine models, sorted by their uppercase engine discriminator, with blocked families removed. `allowed_rule_kinds` narrows this set using those exact discriminators; lowercase aliases are not accepted. Current families:
 
-- **Single question:** `text_match`, `keywords`, `number_equal`, `numeric_range`, `multiple_choice`, `length`, `bonus`, `composite`, `assumption_set`, and `multi_valued`.
-- **Explicit ordered group:** `assumption_set_multi` and `conditional_multi`.
+- **Single question:** `TEXT_MATCH`, `KEYWORDS`, `NUMBER_EQUAL`, `NUMERIC_RANGE`, `MULTIPLE_CHOICE`, `LENGTH`, `BONUS`, `COMPOSITE`, `ASSUMPTION_SET`, and `MULTI_VALUED`.
+- **Explicit ordered group:** `ASSUMPTION_SET_MULTI` and `CONDITIONAL`.
+
+Protected rule fields are `id`, `scope`, `display_name`, `question_types`, and `constraints`. A context-fixed `question_id` is supplied by trusted code. All other declared rule and auxiliary fields are authorable by default. The family exclusions are `REGEX`, `SIMILARITY`, `CODE_TESTS`, `CUSTOM_CODE`, and `CUSTOM_CODE_MULTI`.
 
 Nested rules must be compatible with their question and scope. Multi-valued rules preserve the question's ordered `TEXT`/`NUMERIC` component types. Regex, similarity, and code-executing rules are excluded at every nesting level. Fractional grading policies require teacher-labelled evidence.
 
@@ -180,7 +182,7 @@ RuleGen's Pydantic response schemas avoid provider-unsupported JSON Schema keywo
 | `src/rulegen/constraints.py`, `src/rulegen/models.py`, `src/rulegen/teacher_actions.py` | Bounded response envelopes, synthesis and verification results, and requests for teacher action |
 | `src/rulegen/llm.py`, `src/rulegen/llm_payloads.py`, `src/rulegen/response_schemas.py` | Trusted LiteLLM settings, sanitized payloads, and request-scoped response schemas |
 | `src/rulegen/prompts/` | Generation and verification prompt templates |
-| `src/rulegen/registry.py`, `src/rulegen/preflight.py`, `src/rulegen/validation.py` | Explicit engine family whitelist, trusted-request checks, and validation of LLM outputs |
+| `src/rulegen/registry.py`, `src/rulegen/preflight.py`, `src/rulegen/models.py` | Dynamic engine discovery, family exclusions, trusted-request checks, response models, and shape diagnostics |
 | `src/rulegen/authoring.py`, `src/rulegen/hydration.py` | Engine-derived field ownership/projection, authoring projection and trusted hydration |
 | `src/rulegen/generator.py`, `src/rulegen/execution.py` | Bounded generation and verification, including local candidate-rule execution |
 | `tests/unit/` | One unit test file per tested source module, mirroring `src/rulegen/` |

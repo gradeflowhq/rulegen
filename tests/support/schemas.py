@@ -10,8 +10,8 @@ from rulegen import LLMGenerationRequest, LLMQuestion, LLMRepresentativeCase
 def generation_request(allowed_rule_kinds, *, choice_options=None):
     kind = (
         "CHOICE"
-        if "multiple_choice" in allowed_rule_kinds
-        else ("NUMERIC" if "number_equal" in allowed_rule_kinds else "TEXT")
+        if "MULTIPLE_CHOICE" in allowed_rule_kinds
+        else ("NUMERIC" if "NUMBER_EQUAL" in allowed_rule_kinds else "TEXT")
     )
     return LLMGenerationRequest(
         allowed_rule_kinds=allowed_rule_kinds,
@@ -34,7 +34,7 @@ def root(schema):
 
 
 def definition(schema, union, kind):
-    return resolve(schema, {"$ref": union["discriminator"]["mapping"][kind.upper()]})
+    return resolve(schema, {"$ref": union["discriminator"]["mapping"][kind]})
 
 
 # Request scoped response schemas

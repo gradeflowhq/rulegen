@@ -47,7 +47,7 @@ def test_mixed_request_rejects_unknown_cases_incomplete_answers_and_source_colli
 
 def test_mixed_request_rejects_duplicate_target_identity_and_overlap() -> None:
     request = mixed_request()
-    duplicate_group = Target(question_ids=["q1"], allowed_rule_kinds=["text_match"])
+    duplicate_group = Target(question_ids=["q1"], allowed_rule_kinds=["TEXT_MATCH"])
     with pytest.raises(ValueError, match="target identities must be unique"):
         type(request).model_validate(
             {
@@ -155,7 +155,7 @@ def test_generation_limits_reject_unbounded_or_invalid_values(limits: dict[str, 
 
 
 def test_missing_answer_key_is_distinct_from_explicit_none() -> None:
-    target = Target(question_ids=["q1"], allowed_rule_kinds=["text_match"])
+    target = Target(question_ids=["q1"], allowed_rule_kinds=["TEXT_MATCH"])
     evidence = TargetEvidence(
         labelled_cases=[TargetLabelledCase(case_id="case", expected_points=0)]
     )

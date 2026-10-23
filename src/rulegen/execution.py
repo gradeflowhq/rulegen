@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from copy import deepcopy
+from typing import Any
 
 from gradeflow_engine.question_sets.model import QuestionSet
 from gradeflow_engine.questions.types import Answer, QuestionId
@@ -28,6 +29,11 @@ class CandidateExecutionResult(BaseModel):
 
     validation_errors: list[RuleValidationError]
     results_by_case_id: dict[str, dict[QuestionId, QuestionResult]]
+
+
+def parse_candidate_rule(payload: dict[str, Any] | None) -> QuestionRule:
+    """Let engine rubric construction parse a hydrated candidate for execution."""
+    return Rubric.model_validate({"rules": [payload]}).rules[0]
 
 
 def execute_candidate_rule(

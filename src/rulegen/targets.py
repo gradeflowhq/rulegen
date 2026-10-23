@@ -8,16 +8,13 @@ from pydantic import Field, model_validator
 
 from .constraints import BoundedString, StrictModel
 from .evidence import TargetEvidence
-from .registry import RULE_FAMILIES, MultiQuestionRuleKind, RuleKind, compatible_group_rule_kinds
 
 
 class Target(StrictModel):
     """One question or an explicitly ordered group, determined by question_ids."""
 
     question_ids: list[BoundedString] = Field(min_length=1, max_length=10)
-    allowed_rule_kinds: list[RuleKind | MultiQuestionRuleKind] | None = Field(
-        default=None, min_length=1
-    )
+    allowed_rule_kinds: list[BoundedString] | None = Field(default=None, min_length=1)
 
     @property
     def is_multi_question(self) -> bool:
@@ -29,18 +26,6 @@ class Target(StrictModel):
             raise ValueError("target question_ids must be unique")
         if self.allowed_rule_kinds is not None:
             self.allowed_rule_kinds = list(dict.fromkeys(self.allowed_rule_kinds))
-            if self.is_multi_question:
-                if not set(self.allowed_rule_kinds).issubset(compatible_group_rule_kinds()):
-                    raise ValueError(
-                        "multi-question targets only support multi-question rule kinds"
-                    )
-            else:
-                if not set(self.allowed_rule_kinds).issubset(
-                    {definition.kind for definition in RULE_FAMILIES}
-                ):
-                    raise ValueError(
-                        "single-question targets do not support multi-question rule kinds"
-                    )
         return self
 
 

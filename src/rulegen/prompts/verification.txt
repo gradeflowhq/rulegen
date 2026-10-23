@@ -19,6 +19,6 @@ Requirements:
 
 - Use the trusted questions context to interpret answer types, ordered value_types, choice IDs, and point maxima. A multi-valued answer list belongs to one question; a grouped answers mapping belongs to the explicitly supplied questions.
 - Preserve engine semantics: length bounds are inclusive and words splits on literal spaces; bonus awards the maximum even for missing answers; composite and multi-valued aggregation use child passed flags; assumption weights scale scores before MAX/MIN selection. Nested PARTIAL output is not automatically averaged by its parent.
-- Partial-credit policy must be supported by authoritative teacher case expectations. Never infer that policy from answer frequency or unlabelled observations.
+- Assess whether partial credit is justified by teacher intent and the supplied evidence; teacher-labelled cases are optional.
 
 - The supplied rule contains editable rule and auxiliary fields with normalized engine values, including defaulted settings. Grouped question IDs identify the declared evaluation targets and must remain within that group.

@@ -28,7 +28,7 @@ def _choice_context_request(options: dict[str, str | None]) -> GenerationRequest
         teacher_intent="Award full credit for the correct choice.",
         tasks=(
             TargetTask(
-                target=Target(question_ids=["q1"], allowed_rule_kinds=["multiple_choice"]),
+                target=Target(question_ids=["q1"], allowed_rule_kinds=["MULTIPLE_CHOICE"]),
                 evidence=TargetEvidence(
                     labelled_cases=[TargetLabelledCase(case_id="positive", expected_points=1)],
                     representative_cases=[],
@@ -43,14 +43,11 @@ def _choice_context_request(options: dict[str, str | None]) -> GenerationRequest
 
 
 @pytest.mark.parametrize("group", [False, True])
-def test_target_scores_cannot_exceed_target_maximum(group: bool) -> None:
+def test_target_scores_above_maximum_are_deferred_to_execution(group: bool) -> None:
     request = mixed_request()
     index = 1 if group else 0
     request.tasks[index].evidence.labelled_cases[0].expected_points = 3
-    with pytest.raises(GenerationPreflightError) as error:
-        preflight_check(request)
-    assert len(error.value.issues) == 1
-    assert "maximum" in error.value.issues[0].message
+    preflight_check(request)
 
 
 def test_preflight_attributes_shared_case_answer_issue_to_matching_target_only() -> None:
@@ -143,7 +140,7 @@ def test_preflight_reports_missing_choice_context_with_actionable_issue() -> Non
     assert "b" in issue.message
 
 
-def test_preflight_rejects_expected_points_above_question_maximum() -> None:
+def test_preflight_allows_expected_points_above_question_maximum() -> None:
     request = request_without_allowed_rule_kinds(
         question=TextQuestion(max_points=1, description="Explain the answer.")
     )
@@ -156,11 +153,7 @@ def test_preflight_rejects_expected_points_above_question_maximum() -> None:
         }
     )
     request = request.model_copy(update={"tasks": (task,)})
-    with pytest.raises(GenerationPreflightError) as caught:
-        preflight_check(request)
-    assert any(
-        issue.target_id == "q1" and "maximum" in issue.message for issue in caught.value.issues
-    )
+    preflight_check(request)
 
 
 def test_preflight_rejects_incompatible_allowed_rule_kinds() -> None:
@@ -170,7 +163,7 @@ def test_preflight_rejects_incompatible_allowed_rule_kinds() -> None:
         tasks=(
             TargetTask(
                 target=Target(
-                    question_ids=["q1"], allowed_rule_kinds=["text_match", "multiple_choice"]
+                    question_ids=["q1"], allowed_rule_kinds=["TEXT_MATCH", "MULTIPLE_CHOICE"]
                 ),
                 evidence=TargetEvidence(
                     labelled_cases=[
@@ -199,19 +192,51 @@ def test_preflight_rejects_incompatible_allowed_rule_kinds() -> None:
     assert "incompatible" in issue.message.lower()
 
 
+@pytest.mark.parametrize(
+    "kind", ["REGEX", "SIMILARITY", "CUSTOM_CODE", "FUTURE_UNKNOWN", "text_match"]
+)
+def test_preflight_rejects_blocked_unknown_and_legacy_family_identifiers(kind: str) -> None:
+    request = request_without_allowed_rule_kinds(question=TextQuestion(max_points=1))
+    request.tasks[0].target.allowed_rule_kinds = [kind]
+
+    with pytest.raises(GenerationPreflightError) as caught:
+        preflight_check(request)
+
+    assert any(
+        issue.code is PreflightIssueCode.UNSUPPORTED_ALLOWED_RULE_KINDS
+        for issue in caught.value.issues
+    )
+
+
+@pytest.mark.parametrize("group", [False, True])
+def test_preflight_rejects_family_from_other_target_cardinality(group: bool) -> None:
+    request = mixed_request()
+    target = request.tasks[1 if group else 0].target
+    target.allowed_rule_kinds = ["TEXT_MATCH" if group else "CONDITIONAL"]
+
+    with pytest.raises(GenerationPreflightError) as caught:
+        preflight_check(request)
+
+    assert any(
+        issue.code is PreflightIssueCode.INCOMPATIBLE_ALLOWED_RULE_KINDS
+        and issue.target_id == request.tasks[1 if group else 0].target_id
+        for issue in caught.value.issues
+    )
+
+
 def test_preflight_aggregates_issues_across_targets() -> None:
     request = GenerationRequest(
         request_id="aggregate-preflight-issues",
         teacher_intent="Use the supplied evidence.",
         tasks=(
             TargetTask(
-                target=Target(question_ids=["q1"], allowed_rule_kinds=["text_match"]),
+                target=Target(question_ids=["q1"], allowed_rule_kinds=["TEXT_MATCH"]),
                 evidence=TargetEvidence(
                     labelled_cases=[TargetLabelledCase(case_id="text", expected_points=2)]
                 ),
             ),
             TargetTask(
-                target=Target(question_ids=["q2"], allowed_rule_kinds=["multiple_choice"]),
+                target=Target(question_ids=["q2"], allowed_rule_kinds=["MULTIPLE_CHOICE"]),
                 evidence=TargetEvidence(
                     labelled_cases=[TargetLabelledCase(case_id="choice", expected_points=1)]
                 ),
@@ -232,10 +257,9 @@ def test_preflight_aggregates_issues_across_targets() -> None:
         preflight_check(request)
     issues = caught.value.issues
     assert {issue.code for issue in issues} == {
-        "expected_points_exceeds_target_maximum",
         "missing_choice_option_text",
     }
-    assert {issue.target_id for issue in issues} == {"q1", "q2"}
+    assert {issue.target_id for issue in issues} == {"q2"}
     assert all(issue.field and issue.message for issue in issues)
 
 
@@ -249,7 +273,7 @@ def test_group_preflight_reports_missing_choice_context_for_each_question() -> N
         tasks=(
             TargetTask(
                 target=Target(
-                    question_ids=["q1", "q2"], allowed_rule_kinds=["assumption_set_multi"]
+                    question_ids=["q1", "q2"], allowed_rule_kinds=["ASSUMPTION_SET_MULTI"]
                 ),
                 evidence=TargetEvidence(
                     labelled_cases=[TargetLabelledCase(case_id="case-1", expected_points=2)],

@@ -174,7 +174,7 @@ def test_deterministic_choice_answers_and_case_source_catalog() -> None:
         cases=(CandidateTestCase(case_id="case", answer_map={"q": {"b", "a"}}),),
         tasks=(
             TargetTask(
-                target=Target(question_ids=["q"], allowed_rule_kinds=["multiple_choice"]),
+                target=Target(question_ids=["q"], allowed_rule_kinds=["MULTIPLE_CHOICE"]),
                 evidence=TargetEvidence(
                     labelled_cases=[TargetLabelledCase(case_id="case", expected_points=1)]
                 ),
@@ -256,7 +256,7 @@ def test_llm_request_accepts_one_sided_optional_labels(points: list[int]) -> Non
 
 def test_llm_request_accepts_zero_labels_with_representative() -> None:
     parsed = LLMGenerationRequest(
-        allowed_rule_kinds=["text_match"],
+        allowed_rule_kinds=["TEXT_MATCH"],
         question=LLMQuestion(
             question_id="q1", type="TEXT", max_points=1, description="Name the capital of France."
         ),
@@ -313,19 +313,23 @@ def test_llm_example_collection_is_bounded(factory, field) -> None:
 
 
 def test_question_target_derives_supported_compatible_rule_kinds() -> None:
+    import gc
+
+    # Dynamically created engine subclasses from earlier tests are weakly registered.
+    gc.collect()
     request = request_without_allowed_rule_kinds(
         question=TextQuestion(max_points=1, description="Explain the answer.")
     )
     payload = _requests_build_payload(request)
     assert set(payload.allowed_rule_kinds) == {
-        "keywords",
-        "text_match",
-        "length",
-        "bonus",
-        "composite",
-        "assumption_set",
+        "KEYWORDS",
+        "TEXT_MATCH",
+        "LENGTH",
+        "BONUS",
+        "COMPOSITE",
+        "ASSUMPTION_SET",
     }
-    assert "regex" not in payload.allowed_rule_kinds
+    assert "REGEX" not in payload.allowed_rule_kinds
     schema = synthesis_response_schema(payload)
     strategy = schema["$defs"]["SynthesisCandidatePayload"]["properties"]["rule"]
     assert set(strategy["discriminator"]["mapping"]) == {
@@ -341,7 +345,7 @@ def test_choice_question_target_derives_compatible_families() -> None:
         update={"cases": (CandidateTestCase(case_id="positive", answer_map={"q1": {"a"}}),)}
     )
     payload = _requests_build_payload(request)
-    assert set(payload.allowed_rule_kinds) == {"multiple_choice", "bonus", "assumption_set"}
+    assert set(payload.allowed_rule_kinds) == {"MULTIPLE_CHOICE", "BONUS", "ASSUMPTION_SET"}
 
 
 def test_explicit_allowed_rule_kinds_remain_a_narrowing_mechanism() -> None:
@@ -350,12 +354,12 @@ def test_explicit_allowed_rule_kinds_remain_a_narrowing_mechanism() -> None:
     )
     target = request.tasks[0].target
     assert isinstance(target, Target)
-    narrowed = target.model_copy(update={"allowed_rule_kinds": ["keywords"]})
+    narrowed = target.model_copy(update={"allowed_rule_kinds": ["KEYWORDS"]})
     request = request.model_copy(
         update={"tasks": (request.tasks[0].model_copy(update={"target": narrowed}),)}
     )
     payload = _requests_build_payload(request)
-    assert payload.allowed_rule_kinds == ["keywords"]
+    assert payload.allowed_rule_kinds == ["KEYWORDS"]
 
 
 def test_verification_request_has_no_clarification_catalog() -> None:

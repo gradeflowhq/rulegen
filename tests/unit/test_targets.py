@@ -12,11 +12,11 @@ from rulegen.targets import Target, TargetTask
 @pytest.mark.parametrize(
     ("question_ids", "allowed_rule_kinds", "expected_rule_kinds"),
     [
-        (["q1"], ["text_match", "keywords", "text_match"], ["text_match", "keywords"]),
+        (["q1"], ["TEXT_MATCH", "KEYWORDS", "TEXT_MATCH"], ["TEXT_MATCH", "KEYWORDS"]),
         (
             ["q1", "q2"],
-            ["conditional_multi", "assumption_set_multi", "conditional_multi"],
-            ["conditional_multi", "assumption_set_multi"],
+            ["CONDITIONAL", "ASSUMPTION_SET_MULTI", "CONDITIONAL"],
+            ["CONDITIONAL", "ASSUMPTION_SET_MULTI"],
         ),
     ],
 )
@@ -30,8 +30,8 @@ def test_targets_normalize_duplicate_allowed_rule_kinds_preserving_order(
 
 
 def test_target_cardinality_controls_supported_rule_kinds_and_identity() -> None:
-    single = Target(question_ids=["q1"], allowed_rule_kinds=["text_match"])
-    group = Target(question_ids=["q2", "q1"], allowed_rule_kinds=["conditional_multi"])
+    single = Target(question_ids=["q1"], allowed_rule_kinds=["TEXT_MATCH"])
+    group = Target(question_ids=["q2", "q1"], allowed_rule_kinds=["CONDITIONAL"])
     assert not single.is_multi_question
     assert group.is_multi_question
     evidence = TargetEvidence(representative_cases=[TargetRepresentativeCase(case_id="c", count=1)])
@@ -43,13 +43,13 @@ def test_target_cardinality_controls_supported_rule_kinds_and_identity() -> None
 
 @pytest.mark.parametrize(
     ("question_ids", "allowed_rule_kinds"),
-    [(["q1"], ["conditional_multi"]), (["q1", "q2"], ["text_match"])],
+    [(["q1"], ["CONDITIONAL"]), (["q1", "q2"], ["TEXT_MATCH"])],
 )
-def test_target_rejects_rule_kinds_incompatible_with_cardinality(
+def test_target_defers_rule_kind_compatibility_to_contextual_preflight(
     question_ids: list[str], allowed_rule_kinds: list[str] | None
 ) -> None:
-    with pytest.raises(ValidationError, match="targets"):
-        Target(question_ids=question_ids, allowed_rule_kinds=allowed_rule_kinds)
+    target = Target(question_ids=question_ids, allowed_rule_kinds=allowed_rule_kinds)
+    assert target.allowed_rule_kinds == allowed_rule_kinds
 
 
 @pytest.mark.parametrize("question_ids", [[], ["q1", "q1"]])

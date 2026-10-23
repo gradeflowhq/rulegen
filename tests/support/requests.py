@@ -44,7 +44,7 @@ def mixed_request() -> GenerationRequest:
         ),
         tasks=(
             TargetTask(
-                target=Target(question_ids=["q1"], allowed_rule_kinds=["text_match"]),
+                target=Target(question_ids=["q1"], allowed_rule_kinds=["TEXT_MATCH"]),
                 evidence=TargetEvidence(
                     labelled_cases=[TargetLabelledCase(case_id="shared-case", expected_points=1)],
                     representative_cases=[TargetRepresentativeCase(case_id="single-rep", count=7)],
@@ -52,7 +52,7 @@ def mixed_request() -> GenerationRequest:
             ),
             TargetTask(
                 target=Target(
-                    question_ids=["q2", "q3"], allowed_rule_kinds=["assumption_set_multi"]
+                    question_ids=["q2", "q3"], allowed_rule_kinds=["ASSUMPTION_SET_MULTI"]
                 ),
                 evidence=TargetEvidence(
                     labelled_cases=[TargetLabelledCase(case_id="group-label", expected_points=2)],
@@ -99,7 +99,7 @@ def verification_request() -> LLMVerificationRequest:
     return LLMVerificationRequest(
         questions=[LLMQuestion(question_id="q1", type="TEXT", max_points=1)],
         teacher_intent="Accept a concise yes answer.",
-        rule={"kind": "text_match"},
+        rule={"kind": "TEXT_MATCH"},
         model_case_expectations=[
             ModelCaseExpectation(
                 source_id="representative-1", expected_points=1, reason="Matches intent."
@@ -127,7 +127,7 @@ def verification_request() -> LLMVerificationRequest:
 
 def llm_request() -> LLMGenerationRequest:
     return LLMGenerationRequest(
-        allowed_rule_kinds=["text_match"],
+        allowed_rule_kinds=["TEXT_MATCH"],
         question=LLMQuestion(
             question_id="q1", type="TEXT", max_points=1, description="Name the capital of France."
         ),
@@ -222,7 +222,7 @@ def group_request() -> GenerationRequest:
         tasks=(
             TargetTask(
                 target=Target(
-                    question_ids=["q1", "q2"], allowed_rule_kinds=["assumption_set_multi"]
+                    question_ids=["q1", "q2"], allowed_rule_kinds=["ASSUMPTION_SET_MULTI"]
                 ),
                 evidence=TargetEvidence(
                     labelled_cases=[TargetLabelledCase(case_id="case-1", expected_points=2)],

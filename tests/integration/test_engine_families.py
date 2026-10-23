@@ -55,7 +55,7 @@ def request_for(strategy, question, cases):
         ),
         tasks=(
             TargetTask(
-                target=Target(question_ids=["q"], allowed_rule_kinds=[strategy["type"].lower()]),
+                target=Target(question_ids=["q"], allowed_rule_kinds=[strategy["type"]]),
                 evidence=TargetEvidence(
                     labelled_cases=[
                         TargetLabelledCase(case_id=f"c{i}", expected_points=points)
@@ -149,7 +149,7 @@ def test_new_family_generation_executes_and_verifies(strategy, question, cases):
     result = asyncio.run(RuleGenerator(TEST_LITELLM_CONFIG).generate(request))
     assert result.status == "verified"
     assert result.candidate is not None
-    assert result.candidate.type.lower() == strategy["type"].lower()
+    assert result.candidate.type == strategy["type"]
     verification = payload_from_message(client.calls[1][0][-1].content)
     assert verification["questions"][0]["type"] == question.type
     assert [item["answer"] for item in verification["test_results"]] == [a for a, _ in cases]
@@ -159,19 +159,19 @@ def test_new_family_generation_executes_and_verifies(strategy, question, cases):
         assert type(verification["test_results"][0]["answer"][0]) is int
 
 
-@pytest.mark.parametrize("family", ["assumption_set_multi", "conditional_multi"])
+@pytest.mark.parametrize("family", ["ASSUMPTION_SET_MULTI", "CONDITIONAL"])
 def test_new_families_work_inside_group_and_mixed_generation(family):
     values = {"type": "MULTI_VALUED", "aggregation": "ALL", "rules": [NUMBER, TEXT]}
     members = [{"question_id": "text", **LENGTH}, {"question_id": "values", **values}]
     strategy = (
         {
-            "type": "CONDITIONAL" if family == "conditional_multi" else family.upper(),
+            "type": family,
             "mode": "MAX",
             "assumptions": [{"rules": members}],
         }
-        if family == "assumption_set_multi"
+        if family == "ASSUMPTION_SET_MULTI"
         else {
-            "type": "CONDITIONAL" if family == "conditional_multi" else family.upper(),
+            "type": family,
             "if_rules": [{"question_id": "text", **BONUS}],
             "then_rules": members,
             "else_rules": members,
@@ -201,7 +201,7 @@ def test_new_families_work_inside_group_and_mixed_generation(family):
                 ),
             ),
             TargetTask(
-                target=Target(question_ids=["bonus"], allowed_rule_kinds=["bonus"]),
+                target=Target(question_ids=["bonus"], allowed_rule_kinds=["BONUS"]),
                 evidence=TargetEvidence(
                     labelled_cases=[TargetLabelledCase(case_id="c", expected_points=1)]
                 ),
@@ -237,29 +237,29 @@ def test_failed_verification_does_not_create_applyable_proposal():
 
 
 @pytest.mark.parametrize(
-    "forbidden", ["custom_code", "code_test", "similarity", "transformer", "regex"]
+    "forbidden", ["CUSTOM_CODE", "CUSTOM_CODE_MULTI", "CODE_TESTS", "SIMILARITY", "REGEX"]
 )
-@pytest.mark.parametrize("wrapper", ["composite", "assumption_set", "multi_valued"])
+@pytest.mark.parametrize("wrapper", ["COMPOSITE", "ASSUMPTION_SET", "MULTI_VALUED"])
 def test_strict_provider_schema_excludes_nested_families(forbidden, wrapper):
     child = TEXT
     strategy = (
-        {"type": wrapper.upper(), "assumptions": [{"rule": child}], "mode": "MAX"}
-        if wrapper == "assumption_set"
-        else {"type": wrapper.upper(), "rules": [child], "aggregation": "ALL"}
+        {"type": wrapper, "assumptions": [{"rule": child}], "mode": "MAX"}
+        if wrapper == "ASSUMPTION_SET"
+        else {"type": wrapper, "rules": [child], "aggregation": "ALL"}
     )
     question = (
         MultiValuedQuestion(max_points=2, value_types=["TEXT"])
-        if wrapper == "multi_valued"
+        if wrapper == "MULTI_VALUED"
         else TextQuestion(max_points=2)
     )
-    answer = ["yes"] if wrapper == "multi_valued" else "yes"
+    answer = ["yes"] if wrapper == "MULTI_VALUED" else "yes"
     request = request_for(strategy, question, [(answer, 2)])
     client = ScriptedCompletion([synthesis(strategy, [("c0", 2)]), _verified])
     result = asyncio.run(RuleGenerator(TEST_LITELLM_CONFIG).generate(request))
     assert result.candidate
     structured_output = client.requests[0]["response_format"]["json_schema"]
     assert structured_output["strict"] is True
-    assert forbidden not in json.dumps(structured_output["schema"]).lower()
+    assert forbidden.lower() not in json.dumps(structured_output["schema"]).lower()
 
 
 def test_teacher_label_mismatch_cannot_be_overridden_by_verifier():
@@ -274,6 +274,7 @@ def test_teacher_label_mismatch_cannot_be_overridden_by_verifier():
     "bad_strategy",
     [
         {"type": "MULTI_VALUED", "aggregation": "ALL", "rules": [NUMBER]},
+        {"type": "MULTI_VALUED", "aggregation": "ALL", "rules": [NUMBER, NUMBER, NUMBER]},
         {
             "type": "MULTI_VALUED",
             "aggregation": "ALL",
@@ -291,4 +292,58 @@ def test_multi_valued_count_and_compatibility_failures_never_become_proposals(ba
     result = asyncio.run(RuleGenerator(TEST_LITELLM_CONFIG).generate(request))
     assert not result.candidate
     assert len(client.calls) == 1
-    assert result.validation_failures
+    assert result.reason == "regeneration_budget_exhausted"
+
+
+def test_partial_credit_without_teacher_labels_or_predictions_reaches_verification():
+    from rulegen.evidence import TargetRepresentativeCase
+
+    strategy = {"type": "KEYWORDS", "keywords": ["alpha", "beta"], "mode": "PARTIAL"}
+    request = request_for(strategy, TextQuestion(max_points=2), [("alpha", 1)])
+    request.tasks[0].evidence = TargetEvidence(
+        representative_cases=[TargetRepresentativeCase(case_id="c0", count=1)]
+    )
+    client = ScriptedCompletion([synthesis(strategy, []), _verified])
+    result = asyncio.run(RuleGenerator(TEST_LITELLM_CONFIG).generate(request))
+    assert result.status == "verified"
+    review = payload_from_message(client.calls[1][0][-1].content)
+    assert review["model_case_expectations"] == []
+    assert review["test_results"][0]["actual_points"] == 1
+    assert review["test_results"][0]["expected_points"] is None
+
+
+@pytest.mark.parametrize("kind", ["ASSUMPTION_SET_MULTI", "CONDITIONAL"])
+def test_partial_group_coverage_reaches_verification_without_missing_result_errors(kind):
+    member = {"type": "BONUS", "question_id": "q1"}
+    strategy = (
+        {"type": kind, "assumptions": [{"rules": [member]}]}
+        if kind == "ASSUMPTION_SET_MULTI"
+        else {
+            "type": kind,
+            "if_rules": [member, member],
+            "then_rules": [member],
+            "else_rules": [member],
+        }
+    )
+    request = GenerationRequest(
+        request_id="partial-group",
+        teacher_intent="Award a bonus for q1 only.",
+        question_set=QuestionSet(question_map={"q1": TextQuestion(), "q2": TextQuestion()}),
+        cases=(CandidateTestCase(case_id="case", answer_map={"q1": "yes", "q2": "yes"}),),
+        tasks=(
+            TargetTask(
+                target=Target(question_ids=["q1", "q2"], allowed_rule_kinds=[kind]),
+                evidence=TargetEvidence(
+                    labelled_cases=[TargetLabelledCase(case_id="case", expected_points=1)]
+                ),
+            ),
+        ),
+    )
+    client = ScriptedCompletion([synthesis(strategy, []), _verified])
+    result = asyncio.run(RuleGenerator(TEST_LITELLM_CONFIG).generate_mixed(request))
+    assert result.status == "verified"
+    review = payload_from_message(client.calls[1][0][-1].content)
+    observed = review["test_results"][0]
+    assert observed["actual_points"] == 1
+    assert observed["max_points"] == 2
+    assert "No rule result for question q2" in observed["feedback"]

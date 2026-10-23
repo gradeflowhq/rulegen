@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Annotated, Any, Literal, TypeAlias
 
-from gradeflow_engine.rules.models import QuestionRule
-from pydantic import Field, PrivateAttr, model_validator
+from pydantic import Field, model_validator
 
 from .constraints import (
     BoundedString,
@@ -34,7 +34,7 @@ class SynthesisCandidatePayload(StrictModel):
 
     summary: BoundedString
     rule: dict[str, Any]
-    model_case_expectations: list[ModelCaseExpectation] = Field(min_length=1, max_length=100)
+    model_case_expectations: list[ModelCaseExpectation] = Field(max_length=100)
 
     @model_validator(mode="after")
     def validate_unique_model_case_expectations(self) -> SynthesisCandidatePayload:
@@ -45,14 +45,13 @@ class SynthesisCandidatePayload(StrictModel):
 
 
 class SynthesisCandidate(StrictModel):
-    """Outcome-first candidate envelope with a trusted, private hydrated engine rule."""
+    """Outcome-first envelope containing the unmodified model output."""
 
     # Keep outcome separate from the result fields so the LLM chooses response branch
     # first. Previously, emitting "explanation" first locked the model into
     # no_safe_candidate, causing false refusals in live tests.
     outcome: Literal["candidate"]
     result: SynthesisCandidatePayload
-    _engine_rule: QuestionRule | None = PrivateAttr(default=None)
 
 
 NoSafeCandidateReason: TypeAlias = Literal[
@@ -157,3 +156,17 @@ VerificationResult: TypeAlias = Annotated[
     Verified | Regenerate,
     Field(discriminator="outcome"),
 ]
+
+
+CallPhase = Literal["synthesis", "verification"]
+
+
+@dataclass(frozen=True, slots=True)
+class LLMOutputValidationFailure:
+    """Bounded, non-sensitive diagnostics for one locally rejected structured LLM output."""
+
+    phase: CallPhase
+    attempt: int
+    kind: Literal["shape"]
+    error_codes: tuple[str, ...]
+    field_paths: tuple[str, ...]

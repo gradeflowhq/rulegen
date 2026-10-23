@@ -1,72 +1,123 @@
-"""Construct engine rules from provider-schema-conforming authoring payloads and trusted context."""
+"""Populate trusted targets in engine-shaped rule payloads."""
 
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any, cast
+from types import UnionType
+from typing import Any, Union, get_args, get_origin
 
 from gradeflow_engine.rules.context import RuleContext, RulePath
-from gradeflow_engine.rules.models import QuestionRule
 from gradeflow_engine.rules.models.base import BaseRule
 from gradeflow_engine.rules.schema import rule_type
+from pydantic import BaseModel
 
-from .authoring import child_context
-from .registry import GROUP_MODELS, RULE_FAMILIES
+from . import registry
+from .authoring import rule_annotation, unwrapped
 
 
-def hydrate_rule(payload: dict[str, Any], context: RuleContext) -> QuestionRule:
-    """Supply trusted targets and let Pydantic construct models and populate defaults.
+def hydrate_rule(
+    payload: dict[str, Any], context: RuleContext
+) -> tuple[type[BaseRule] | None, dict[str, Any]]:
+    """Copy input and populate trusted targets; callers own validation and parsing."""
 
-    Payloads come from generate() LLM calls. Provider enforcement of the strict
-    request-specific authoring schema is a package contract; this internal helper
-    does not revalidate that schema. Callers validate contextual semantics afterwards.
-    """
-
-    def prepare(raw: dict[str, Any], ctx: RuleContext) -> tuple[type[BaseRule], dict[str, Any]]:
+    def prepare(raw: Any, ctx: RuleContext) -> tuple[type[BaseRule] | None, Any]:
+        if not isinstance(raw, dict):
+            return None, raw
         if ctx.scope == "question" and ctx.question_id_editable:
-            qid = raw["question_id"]
-            ctx = replace(ctx, question_id=qid, question=ctx.question_set.question_map[qid])
-        models = (
-            GROUP_MODELS
-            if ctx.scope == "global"
-            else tuple(
-                family.value_model if ctx.scope == "value" else family.question_model
-                for family in RULE_FAMILIES
+            qid = raw.get("question_id")
+            ctx = replace(
+                ctx,
+                question_id=qid,
+                question=ctx.question_set.question_map.get(qid) if isinstance(qid, str) else None,
             )
-        )
-        model = next(m for m in models if m is not None and rule_type(m) == raw["type"])
-        data = dict(raw)
+        # Resolve models without filtering authoring policy or question compatibility.
+        models = registry.compatible_rule_classes(replace(ctx, question=None, slot_index=None))
+        model = next((m for m in models if rule_type(m) == raw.get("type")), None)
+        if model is None:
+            return None, dict(raw)
+        data = prepare_model(raw, model, ctx, model, ())
         if "question_id" in model.model_fields and not ctx.question_id_editable:
             data["question_id"] = ctx.question_id
-
-        def child(value: dict[str, Any], path: RulePath) -> dict[str, Any]:
-            return prepare(value, child_context(model, ctx, path))[1]
-
-        kind = rule_type(model)
-        if kind in {"COMPOSITE", "MULTI_VALUED"} and "rules" in data:
-            data["rules"] = [
-                child(value, ("rules", index)) for index, value in enumerate(data["rules"])
-            ]
-        elif kind in {"ASSUMPTION_SET", "ASSUMPTION_SET_MULTI"} and "assumptions" in data:
-            assumptions = []
-            for index, value in enumerate(data["assumptions"]):
-                assumption = dict(value)
-                if kind == "ASSUMPTION_SET_MULTI" and "rules" in assumption:
-                    assumption["rules"] = [
-                        child(rule, ("assumptions", index, "rules", rule_index))
-                        for rule_index, rule in enumerate(assumption["rules"])
-                    ]
-                elif "rule" in assumption:
-                    assumption["rule"] = child(assumption["rule"], ("assumptions", index, "rule"))
-                assumptions.append(assumption)
-            data["assumptions"] = assumptions
-        elif kind == "CONDITIONAL":
-            for field in ("if_rules", "then_rules", "else_rules"):
-                if field in data:
-                    data[field] = [
-                        child(value, (field, index)) for index, value in enumerate(data[field])
-                    ]
         return model, data
 
-    model, data = prepare(payload, context)
-    return cast(QuestionRule, model.model_validate(data))
+    def prepare_model(
+        raw: dict[str, Any],
+        model: type[BaseModel],
+        ctx: RuleContext,
+        owner: type[BaseRule],
+        path: RulePath,
+    ) -> dict[str, Any]:
+        return {
+            name: prepare_value(
+                value, model.model_fields[name].annotation, ctx, owner, (*path, name)
+            )
+            if name in model.model_fields
+            else value
+            for name, value in raw.items()
+        }
+
+    def prepare_value(
+        value: Any,
+        annotation: Any,
+        ctx: RuleContext,
+        owner: type[BaseRule],
+        path: RulePath,
+    ) -> Any:
+        annotation = unwrapped(annotation)
+        origin, args = get_origin(annotation), get_args(annotation)
+        if rule_annotation(annotation):
+            try:
+                nested = owner.nested_context(ctx, path)
+            except ValueError:
+                nested = None
+            # Invalid question/slot compatibility is reported by engine rubric
+            # validation. Hydration still traverses nested payloads.
+            if nested is None:
+                nested = replace(ctx, scope="value", slot_index=None)
+            return prepare(value, nested)[1]
+        if value is None:
+            return None
+        if origin in (Union, UnionType):
+            # Follow model/container shapes to populate any nested trusted targets.
+            # Primitive union coercion remains engine-owned.
+            for member in args:
+                member = unwrapped(member)
+                if (
+                    isinstance(value, dict)
+                    and (
+                        get_origin(member) is dict
+                        or isinstance(member, type)
+                        and issubclass(member, BaseModel)
+                    )
+                    or isinstance(value, list)
+                    and get_origin(member) in (list, tuple, set, frozenset)
+                ):
+                    return prepare_value(value, member, ctx, owner, path)
+            return value
+        if origin in (list, tuple, set, frozenset) and args and isinstance(value, list):
+            return [
+                prepare_value(
+                    child,
+                    args[min(index, len(args) - 1)]
+                    if origin is tuple and args[-1] is not Ellipsis
+                    else args[0],
+                    ctx,
+                    owner,
+                    (*path, index),
+                )
+                for index, child in enumerate(value)
+            ]
+        if origin is dict and len(args) == 2 and isinstance(value, dict):
+            return {
+                key: prepare_value(child, args[1], ctx, owner, (*path, key))
+                for key, child in value.items()
+            }
+        if (
+            isinstance(annotation, type)
+            and issubclass(annotation, BaseModel)
+            and isinstance(value, dict)
+        ):
+            return prepare_model(value, annotation, ctx, owner, path)
+        return value
+
+    return prepare(payload, context)

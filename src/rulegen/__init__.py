@@ -28,6 +28,7 @@ from .llm_payloads import (
     llm_answer,
 )
 from .models import (
+    LLMOutputValidationFailure,
     RegenerationFailure,
     SynthesisCandidate,
     SynthesisResponse,
@@ -47,7 +48,6 @@ from .targets import (
     TargetTask,
 )
 from .teacher_actions import TeacherAction, TeacherActionRequest
-from .validation import LLMOutputValidationFailure
 
 __all__ = [
     "CandidateExecutionResult",

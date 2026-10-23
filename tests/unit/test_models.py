@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 import pytest
@@ -15,6 +16,9 @@ from rulegen.models import (
     SynthesisResponse,
     VerificationResult,
 )
+from tests.support.completion import _model_case_expectations as expectations_for_cases
+from tests.support.completion import _synthesis
+from tests.support.requests import group_strategy
 
 # Canonical synthesis result parsing
 
@@ -67,7 +71,7 @@ def test_synthesis_response_parses_and_round_trips(envelope: dict[str, Any]) -> 
     parsed = adapter.validate_json(json.dumps(envelope))
     assert parsed.model_dump(exclude_unset=True) == envelope
     assert adapter.validate_python(dict(reversed(envelope.items()))) == parsed
-    assert "_engine_rule" not in parsed.model_dump()
+    assert "_hydrated_rule" not in parsed.model_dump()
     if isinstance(parsed, SynthesisCandidate):
         assert all(
             isinstance(expectation, ModelCaseExpectation)
@@ -98,7 +102,7 @@ def test_outer_response_model_does_not_validate_nested_authoring_schema(rule) ->
     parsed = TypeAdapter(SynthesisResponse).validate_json(json.dumps(payload))
     assert isinstance(parsed, SynthesisCandidate)
     assert parsed.result.rule == rule
-    assert parsed._engine_rule is None
+    assert not hasattr(parsed, "_hydrated_rule")
 
 
 def test_model_case_expectations_rejects_duplicates() -> None:
@@ -247,3 +251,74 @@ def test_generate_group_does_not_allow_verifier_clarification() -> None:
 def test_synthesis_rejects_invalid_envelopes(envelope: dict[str, Any] | list[Any]) -> None:
     with pytest.raises(ValidationError):
         TypeAdapter(SynthesisResponse).validate_json(json.dumps(envelope))
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize(
+    ("problem", "code"),
+    [
+        ("missing", None),
+        ("extra", None),
+        ("duplicate", "duplicate source IDs"),
+        ("negative", "greater than or equal to 0"),
+        ("nonfinite", "finite"),
+        ("above_max", None),
+        ("teacher_conflict", None),
+    ],
+)
+def test_model_case_expectations_only_enforce_response_shape(grouped, problem, code):
+    if grouped:
+        payload = {
+            "outcome": "candidate",
+            "result": {
+                "summary": "Award both correct answers.",
+                "rule": group_strategy(),
+                "model_case_expectations": expectations_for_cases(
+                    [("case-1", 2), ("representative", 0)]
+                ),
+            },
+        }
+    else:
+        payload = _synthesis(["Paris"])
+    expectations = payload["result"]["model_case_expectations"]
+    if problem == "missing":
+        expectations.pop()
+    elif problem in {"extra", "duplicate"}:
+        expectations.append(
+            {
+                "source_id": "fabricated" if problem == "extra" else expectations[0]["source_id"],
+                "expected_points": 0,
+                "reason": "An invalid additional case.",
+            }
+        )
+    else:
+        expectations[0]["expected_points"] = {
+            "negative": -1,
+            "nonfinite": math.inf,
+            "above_max": 3,
+            "teacher_conflict": 0,
+        }[problem]
+    if problem in {"duplicate", "negative", "nonfinite"}:
+        with pytest.raises(ValidationError, match=code):
+            TypeAdapter(SynthesisResponse).validate_python(payload)
+        return
+    output = TypeAdapter(SynthesisResponse).validate_python(payload)
+    assert isinstance(output, SynthesisCandidate)
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+def test_model_case_expectations_preserve_teacher_label_comparison_tolerance(grouped):
+    payload = (
+        {
+            "outcome": "candidate",
+            "result": {
+                "summary": "Award both correct answers.",
+                "rule": group_strategy(),
+                "model_case_expectations": expectations_for_cases([("case-1", 2 - 5e-10)]),
+            },
+        }
+        if grouped
+        else _synthesis(["Paris"], expectations=[("positive", 1 - 5e-10), ("negative", 0)])
+    )
+    output = TypeAdapter(SynthesisResponse).validate_python(payload)
+    assert isinstance(output, SynthesisCandidate)

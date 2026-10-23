@@ -13,16 +13,14 @@ from gradeflow_engine.questions.models.numeric import NumericQuestion
 from gradeflow_engine.questions.models.text import TextQuestion
 
 from .registry import (
-    RULE_FAMILIES,
-    compatible_group_rule_kinds,
     resolve_target_rule_kinds,
+    supported_rule_kinds,
 )
 from .requests import GenerationRequest
 from .targets import TargetTask
 
 
 class PreflightIssueCode(StrEnum):
-    EXPECTED_POINTS_EXCEEDS_TARGET_MAXIMUM = "expected_points_exceeds_target_maximum"
     ANSWER_QUESTION_NOT_FOUND = "answer_question_not_found"
     NO_COMPATIBLE_RULE_KINDS = "no_compatible_rule_kinds"
     UNSUPPORTED_ALLOWED_RULE_KINDS = "unsupported_allowed_rule_kinds"
@@ -78,7 +76,6 @@ def preflight_check(request: GenerationRequest) -> None:
 
     for task_index, task in enumerate(request.tasks):
         target = task.target
-        target_id = task.target_id
         target_questions = [question_map[qid] for qid in target.question_ids]
 
         _check_target_rule_kinds(
@@ -93,24 +90,6 @@ def preflight_check(request: GenerationRequest) -> None:
             target_questions=target_questions,
             issues=issues,
         )
-
-        max_points = sum(question.max_points for question in target_questions)
-        for label_index, label in enumerate(task.evidence.labelled_cases):
-            if label.expected_points > max_points:
-                issues.append(
-                    PreflightIssue(
-                        code=PreflightIssueCode.EXPECTED_POINTS_EXCEEDS_TARGET_MAXIMUM,
-                        target_id=target_id,
-                        field=(
-                            f"tasks.{task_index}.evidence.labelled_cases."
-                            f"{label_index}.expected_points"
-                        ),
-                        message=(
-                            f"Expected points {label.expected_points} for target {target_id!r} "
-                            f"exceed its maximum of {max_points}."
-                        ),
-                    )
-                )
 
     for case_index, case in enumerate(request.cases):
         for question_id, answer in case.answer_map.items():
@@ -174,8 +153,7 @@ def _check_target_rule_kinds(
             )
         return
 
-    supported = {definition.kind for definition in RULE_FAMILIES}
-    all_supported = supported | set(compatible_group_rule_kinds())
+    all_supported = supported_rule_kinds()
     unsupported = [kind for kind in explicit if kind not in all_supported]
     if unsupported:
         issues.append(
@@ -190,7 +168,7 @@ def _check_target_rule_kinds(
             )
         )
 
-    incompatible = [kind for kind in explicit if kind not in compatible]
+    incompatible = [kind for kind in explicit if kind in all_supported and kind not in compatible]
     if incompatible:
         issues.append(
             PreflightIssue(

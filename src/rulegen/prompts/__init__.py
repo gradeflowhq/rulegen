@@ -58,7 +58,7 @@ def payload_from_message(content: str) -> dict[str, Any]:
 class FormatRetryContext:
     """Bounded local diagnostics safe to disclose on one format retry."""
 
-    kind: Literal["shape", "catalog"]
+    kind: Literal["shape"]
     error_codes: tuple[str, ...]
     field_paths: tuple[str, ...]
 
@@ -88,7 +88,7 @@ class FormatRetryContext:
 
     def as_payload(self) -> dict[str, object]:
         return {
-            "reason": "local_shape_or_catalog_validation_failed",
+            "reason": "local_shape_validation_failed",
             "kind": self.kind,
             "error_codes": list(self.error_codes),
             "field_paths": list(self.field_paths),
@@ -126,9 +126,9 @@ def group_generation_messages(
     payload = request.model_dump(mode="json")
     payload["combined_rule_guidance"] = (
         "The questions array defines group membership and order. "
-        "Use only an allowed grouped rule. For assumption_set_multi, every assumption must "
+        "Use only an allowed grouped rule. For ASSUMPTION_SET_MULTI, every assumption must "
         "contain exactly one question rule for every question_id in the trusted order. For "
-        "conditional_multi, conditions may reference group questions, but both then_rules and "
+        "CONDITIONAL, conditions may reference group questions, but both then_rules and "
         "else_rules must contain exactly one rule for every question_id in the trusted order. "
         "Never add, omit, reorder, or split group questions, and never reference a question "
         "outside this group."

@@ -8,8 +8,17 @@ from gradeflow_engine.question_sets.model import QuestionSet
 from gradeflow_engine.questions.models import ChoiceQuestion, TextQuestion
 from gradeflow_engine.rubrics.model import Rubric
 from gradeflow_engine.rules.models import MultipleChoiceQuestionRule, TextMatchQuestionRule
+from pydantic import TypeAdapter
 
-from rulegen.execution import CandidateTestCase, execute_candidate_rule
+from rulegen.evidence import TargetEvidence, TargetLabelledCase
+from rulegen.execution import CandidateTestCase, execute_candidate_rule, parse_candidate_rule
+from rulegen.hydration import hydrate_rule
+from rulegen.llm_payloads import build_llm_generation_payload, generation_context
+from rulegen.models import SynthesisResponse
+from rulegen.preflight import preflight_check
+from rulegen.registry import resolve_target_rule_kinds
+from rulegen.requests import GenerationRequest
+from rulegen.targets import Target, TargetTask
 
 
 def _question_set() -> QuestionSet:
@@ -119,3 +128,72 @@ def test_execute_candidate_rule_validates_prospective_rubric_once(
 
     assert result.validation_errors == []
     assert calls == 1
+
+
+def test_group_parsing_defers_unknown_nested_choice_to_engine() -> None:
+    request = GenerationRequest(
+        request_id="choice-request",
+        teacher_intent="Use the choices.",
+        tasks=(
+            TargetTask(
+                target=Target(
+                    question_ids=["q1", "q2"], allowed_rule_kinds=["ASSUMPTION_SET_MULTI"]
+                ),
+                evidence=TargetEvidence(
+                    labelled_cases=[TargetLabelledCase(case_id="case-1", expected_points=2)],
+                    representative_cases=[],
+                ),
+            ),
+        ),
+        question_set=QuestionSet(
+            question_map={
+                "q1": ChoiceQuestion(max_points=1, options={"a": "A"}),
+                "q2": ChoiceQuestion(max_points=1, options={"b": "B"}),
+            }
+        ),
+        cases=(CandidateTestCase(case_id="case-1", answer_map={"q1": {"a"}, "q2": {"b"}}),),
+    )
+    task = request.tasks[0]
+    preflight_check(request)
+    resolved = resolve_target_rule_kinds(
+        request.question_set, task.target.question_ids, task.target.allowed_rule_kinds
+    )
+    llm_request = build_llm_generation_payload(
+        request=request, task=task, resolved_rule_kinds=resolved
+    )
+    payload = {
+        "outcome": "candidate",
+        "result": {
+            "summary": "choices",
+            "rule": {
+                "type": "ASSUMPTION_SET_MULTI",
+                "assumptions": [
+                    {
+                        "rules": [
+                            {
+                                "question_id": "q1",
+                                "type": "MULTIPLE_CHOICE",
+                                "answer": ["unknown"],
+                                "mode": "ALL",
+                            },
+                            {
+                                "question_id": "q2",
+                                "type": "MULTIPLE_CHOICE",
+                                "answer": ["b"],
+                                "mode": "ALL",
+                            },
+                        ]
+                    }
+                ],
+            },
+            "model_case_expectations": [
+                {"source_id": "case-1", "expected_points": 2, "reason": "case"}
+            ],
+        },
+    }
+    output = TypeAdapter(SynthesisResponse).validate_python(payload)
+    _, hydrated = hydrate_rule(output.result.rule, generation_context(llm_request))
+    result = execute_candidate_rule(
+        parse_candidate_rule(hydrated), request.question_set, request.cases
+    )
+    assert any("Invalid answer choices" in error for error in result.validation_errors)

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Annotated, Any, TypeAlias, cast
+from typing import TYPE_CHECKING, Annotated, Any, TypeAlias
 
+from gradeflow_engine.question_sets.model import QuestionSet
 from gradeflow_engine.questions.models.choice import ChoiceQuestion
 from gradeflow_engine.questions.models.multi_valued import MultiValuedQuestion, MultiValueTypes
 from gradeflow_engine.questions.types import QuestionType
+from gradeflow_engine.rules.context import RuleContext
 from pydantic import Field, StrictInt, StrictStr
 
 from .constraints import (
@@ -20,7 +22,6 @@ from .constraints import (
     StrictModel,
 )
 from .models import ModelCaseExpectation, RegenerationFailure
-from .registry import MultiQuestionRuleKind, RuleKind
 from .targets import TargetTask
 
 if TYPE_CHECKING:
@@ -79,7 +80,7 @@ class LLMGenerationRequest(StrictModel):
     TargetEvidence, Target, and GenerationRequest own request business invariants.
     """
 
-    allowed_rule_kinds: list[RuleKind] = Field(min_length=1)
+    allowed_rule_kinds: list[BoundedString] = Field(min_length=1)
     question: LLMQuestion
     teacher_intent: LargeBoundedString
     teacher_case_expectations: list[LLMTeacherCaseExpectation] = Field(
@@ -98,7 +99,7 @@ class LLMGroupGenerationRequest(StrictModel):
     """
 
     questions: list[LLMQuestion] = Field(min_length=2, max_length=10)
-    allowed_rule_kinds: list[MultiQuestionRuleKind] = Field(min_length=1)
+    allowed_rule_kinds: list[BoundedString] = Field(min_length=1)
     teacher_intent: LargeBoundedString
     teacher_case_expectations: list[LLMTeacherCaseExpectation] = Field(
         default_factory=list, max_length=MAX_LLM_CASES
@@ -135,7 +136,7 @@ class LLMVerificationRequest(StrictModel):
     teacher_intent: LargeBoundedString
     rule: dict[str, Any]
     questions: list[LLMQuestion] = Field(min_length=1, max_length=10)
-    model_case_expectations: list[ModelCaseExpectation] = Field(min_length=1, max_length=100)
+    model_case_expectations: list[ModelCaseExpectation] = Field(max_length=100)
     test_results: list[VerificationTestResult] = Field(min_length=1, max_length=100)
     teacher_label_mismatch_test_result_ids: list[BoundedString] = Field(
         default_factory=list, max_length=50
@@ -147,7 +148,7 @@ class LLMVerificationRequest(StrictModel):
 
 class RegenerationContext(StrictModel):
     rule: dict[str, Any]
-    model_case_expectations: list[ModelCaseExpectation] = Field(min_length=1, max_length=100)
+    model_case_expectations: list[ModelCaseExpectation] = Field(max_length=100)
     failure: RegenerationFailure
     cited_test_results: list[VerificationTestResult] = Field(default_factory=list, max_length=50)
 
@@ -174,7 +175,7 @@ def build_llm_generation_payload(
     *,
     request: GenerationRequest,
     task: TargetTask,
-    resolved_rule_kinds: Sequence[RuleKind | MultiQuestionRuleKind],
+    resolved_rule_kinds: Sequence[str],
 ) -> LLMGenerationRequest | LLMGroupGenerationRequest:
     """Build disclosure for a declared task from the trusted request."""
     target = task.target
@@ -206,7 +207,7 @@ def build_llm_generation_payload(
         return LLMGroupGenerationRequest(
             teacher_intent=request.teacher_intent,
             questions=questions,
-            allowed_rule_kinds=cast(list[MultiQuestionRuleKind], list(resolved_rule_kinds)),
+            allowed_rule_kinds=list(resolved_rule_kinds),
             teacher_case_expectations=[
                 LLMTeacherCaseExpectation(
                     source_id=item.case_id,
@@ -233,7 +234,7 @@ def build_llm_generation_payload(
     return LLMGenerationRequest(
         teacher_intent=request.teacher_intent,
         question=questions[0],
-        allowed_rule_kinds=cast(list[RuleKind], list(resolved_rule_kinds)),
+        allowed_rule_kinds=list(resolved_rule_kinds),
         teacher_case_expectations=[
             LLMTeacherCaseExpectation(
                 source_id=item.case_id,
@@ -258,4 +259,33 @@ def build_llm_generation_payload(
             )
             for item in evidence.representative_cases
         ],
+    )
+
+
+def generation_context(request: LLMGenerationRequest | LLMGroupGenerationRequest) -> RuleContext:
+    """Rebuild only trusted target metadata, restricting groups to declared order."""
+    questions = (
+        request.questions if isinstance(request, LLMGroupGenerationRequest) else [request.question]
+    )
+    data = {}
+    for question in questions:
+        fields: dict[str, object] = {
+            "type": question.type,
+            "max_points": question.max_points,
+            "description": question.description,
+        }
+        if question.type == "CHOICE":
+            fields["options"] = question.choice_options
+        elif question.type == "MULTI_VALUED":
+            fields["value_types"] = question.value_types
+        data[question.question_id] = fields
+    question_set = QuestionSet.model_validate({"question_map": data})
+    if isinstance(request, LLMGroupGenerationRequest):
+        return RuleContext(scope="global", question_set=question_set)
+    qid = request.question.question_id
+    return RuleContext(
+        scope="question",
+        question_set=question_set,
+        question_id=qid,
+        question=question_set.question_map[qid],
     )

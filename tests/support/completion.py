@@ -201,7 +201,7 @@ def _request(
         teacher_intent="Accept Paris exactly.",
         tasks=(
             TargetTask(
-                target=Target(question_ids=["q1"], allowed_rule_kinds=["text_match"]),
+                target=Target(question_ids=["q1"], allowed_rule_kinds=["TEXT_MATCH"]),
                 evidence=TargetEvidence(
                     labelled_cases=[
                         TargetLabelledCase(case_id="positive", expected_points=1),
@@ -247,7 +247,7 @@ def _comments_only_request(*, limits: GenerationLimits | None = None) -> Generat
         teacher_intent="Accept Paris exactly.",
         tasks=(
             TargetTask(
-                target=Target(question_ids=["q1"], allowed_rule_kinds=["text_match"]),
+                target=Target(question_ids=["q1"], allowed_rule_kinds=["TEXT_MATCH"]),
                 evidence=TargetEvidence(
                     labelled_cases=[],
                     representative_cases=[
@@ -276,7 +276,7 @@ def _choice_request(choice_options: dict[str, str | None]) -> GenerationRequest:
         teacher_intent="Accept only a.",
         tasks=(
             TargetTask(
-                target=Target(question_ids=["q1"], allowed_rule_kinds=["multiple_choice"]),
+                target=Target(question_ids=["q1"], allowed_rule_kinds=["MULTIPLE_CHOICE"]),
                 evidence=TargetEvidence(
                     labelled_cases=[
                         TargetLabelledCase(case_id="positive", expected_points=2),

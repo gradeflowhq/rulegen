@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import math
-from collections.abc import Callable
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Literal, Protocol, TypeAlias, TypeVar, cast
@@ -26,7 +26,9 @@ from .execution import (
     CandidateExecutionResult,
     CandidateTestCase,
     execute_candidate_rule,
+    parse_candidate_rule,
 )
+from .hydration import hydrate_rule
 from .llm import (
     ChatMessage,
     JSONSchema,
@@ -39,10 +41,13 @@ from .llm_payloads import (
     RegenerationContext,
     VerificationTestResult,
     build_llm_generation_payload,
+    generation_context,
     llm_answer,
 )
 from .models import (
     MAX_TEST_RESULT_IDS,
+    CallPhase,
+    LLMOutputValidationFailure,
     ModelCaseExpectation,
     NoSafeCandidate,
     RegenerationFailure,
@@ -71,18 +76,6 @@ from .response_schemas import (
     verification_response_schema,
 )
 from .teacher_actions import TeacherAction, TeacherActionRequest
-from .validation import (
-    CallPhase,
-    CatalogValidationError,
-    GroupValidationContext,
-    LLMOutputValidationFailure,
-    _validate_group_synthesis_catalog,
-    _validate_synthesis_catalog,
-    _validate_verification_catalog,
-    catalog_validation_failure,
-    generation_context,
-    shape_validation_failure,
-)
 
 ResultStatus = Literal[
     "verified",
@@ -103,7 +96,7 @@ class GenerationBudgetExceeded(RuntimeError):
 
 
 class TypedOutputError(RuntimeError):
-    """An LLM output failed the bounded local shape/catalog validation retry."""
+    """An LLM output failed the bounded local shape validation retry."""
 
 
 class _ProviderCallFailure(RuntimeError):
@@ -114,7 +107,11 @@ class _ProviderCallFailure(RuntimeError):
         self.code = code
 
 
-_RECOVERABLE_CANDIDATE_ERRORS = (CatalogValidationError, ExecutorError, GradingError)
+_RECOVERABLE_CANDIDATE_ERRORS = (
+    ValidationError,
+    ExecutorError,
+    GradingError,
+)
 
 
 # endregion
@@ -185,9 +182,6 @@ def _token_count(usage: object, name: str) -> int | None:
 
 class MessageBuilder(Protocol):
     def __call__(self, *, format_retry: FormatRetryContext | None) -> ChatMessage: ...
-
-
-Validator = Callable[[ModelT], None]
 
 
 @dataclass(slots=True)
@@ -306,6 +300,33 @@ def _prepare_jobs(request: GenerationRequest) -> tuple[tuple[str, _PreparedJob],
 # region RuleGenerators
 
 
+def _field_path(location: Sequence[object]) -> str:
+    if not location:
+        return "$"  # Represent the root of the schema
+    return ".".join(str(part) for part in location)
+
+
+def shape_validation_failure(
+    exc: ValidationError,
+    *,
+    phase: CallPhase,
+    attempt: int,
+) -> LLMOutputValidationFailure:
+    errors = exc.errors(include_url=False, include_context=False, include_input=False)
+    # An extra-field location contains the LLM-invented key. Keep its stable
+    # error code, but omit that untrusted key from diagnostics.
+    safe_path_errors = [error for error in errors if error["type"] != "extra_forbidden"]
+    return LLMOutputValidationFailure(
+        phase=phase,
+        attempt=attempt,
+        kind="shape",
+        error_codes=tuple(dict.fromkeys(str(error["type"]) for error in errors))[:20],
+        field_paths=tuple(
+            dict.fromkeys(_field_path(error.get("loc", ())) for error in safe_path_errors)
+        )[:20],
+    )
+
+
 class RuleGenerator:
     """Run one bounded rule-generation request revision.
 
@@ -374,7 +395,6 @@ class RuleGenerator:
         response_schema: JSONSchema,
         conversation: _Conversation,
         build_message: MessageBuilder,
-        validator: Validator[ModelT],
         max_format_retries: int,
         budget: _Budget,
         validation_failures: list[LLMOutputValidationFailure],
@@ -452,7 +472,6 @@ class RuleGenerator:
                 raise _ProviderCallFailure("invalid_response")
             try:
                 parsed = output_model.validate_json(raw_payload)
-                validator(parsed)
                 conversation.accept(messages, parsed)
                 _LOGGER.info(
                     "rulegen LLM response validated: phase=%s format_attempt=%d",
@@ -462,20 +481,6 @@ class RuleGenerator:
                 return parsed
             except ValidationError as exc:
                 failure = shape_validation_failure(exc, phase=phase, attempt=attempt)
-                validation_failures.append(failure)
-                _LOGGER.info(
-                    "rulegen LLM response rejected: phase=%s format_attempt=%d kind=%s",
-                    phase,
-                    attempt,
-                    failure.kind,
-                )
-                format_retry = FormatRetryContext(
-                    kind=failure.kind,
-                    error_codes=failure.error_codes,
-                    field_paths=failure.field_paths,
-                )
-            except CatalogValidationError as exc:
-                failure = catalog_validation_failure(exc, phase=phase, attempt=attempt)
                 validation_failures.append(failure)
                 _LOGGER.info(
                     "rulegen LLM response rejected: phase=%s format_attempt=%d kind=%s",
@@ -528,10 +533,6 @@ class RuleGenerator:
                         request.llm_request,
                         regeneration=regeneration,
                     ),
-                    validator=partial(
-                        _validate_synthesis_catalog,
-                        request=request.llm_request,
-                    ),
                     max_format_retries=request.limits.max_format_retries,
                     budget=budget,
                     validation_failures=validation_failures,
@@ -567,9 +568,12 @@ class RuleGenerator:
 
                 latest_candidate = None
 
-                # COMPILATION AND EXECUTION
+                # ENGINE PARSING AND EXECUTION
                 try:
-                    candidate = cast(QuestionRule, synthesis_response._engine_rule)
+                    _, hydrated_rule = hydrate_rule(
+                        synthesis_response.result.rule, generation_context(request.llm_request)
+                    )
+                    candidate = parse_candidate_rule(hydrated_rule)
                     latest_candidate = candidate
                     _LOGGER.info(
                         "rulegen candidate hydrated",
@@ -654,7 +658,7 @@ class RuleGenerator:
                     )
                     continue
 
-                verification = await self._call_typed(
+                verification: VerificationResult = await self._call_typed(
                     phase="verification",
                     conversation=conversation,
                     output_model=TypeAdapter(VerificationResult),
@@ -663,10 +667,6 @@ class RuleGenerator:
                     build_message=partial(
                         verification_messages,
                         verification_request,
-                    ),
-                    validator=partial(
-                        _validate_verification_catalog,
-                        request=verification_request,
                     ),
                     max_format_retries=request.limits.max_format_retries,
                     budget=budget,
@@ -746,13 +746,6 @@ class RuleGenerator:
                         request.llm_request,
                         regeneration=regeneration,
                     ),
-                    validator=partial(
-                        _validate_group_synthesis_catalog,
-                        request=GroupValidationContext(
-                            llm_request=request.llm_request,
-                            question_set=request.question_set,
-                        ),
-                    ),
                     max_format_retries=request.limits.max_format_retries,
                     budget=budget,
                     validation_failures=failures,
@@ -780,7 +773,10 @@ class RuleGenerator:
                     )
                 latest_candidate = None
                 try:
-                    candidate = cast(QuestionRule, synthesis_response._engine_rule)
+                    _, hydrated_rule = hydrate_rule(
+                        synthesis_response.result.rule, generation_context(request.llm_request)
+                    )
+                    candidate = parse_candidate_rule(hydrated_rule)
                     latest_candidate = candidate
                     execution = execute_candidate_rule(
                         candidate,
@@ -839,14 +835,13 @@ class RuleGenerator:
                         context=generation_context(request.llm_request),
                     )
                     continue
-                latest_verification = await self._call_typed(
+                latest_verification: VerificationResult = await self._call_typed(
                     phase="verification",
                     conversation=conversation,
                     output_model=TypeAdapter(VerificationResult),
                     output_name="VerificationResult",
                     response_schema=verification_response_schema(),
                     build_message=partial(verification_messages, verification_request),
-                    validator=partial(_validate_verification_catalog, request=verification_request),
                     max_format_retries=request.limits.max_format_retries,
                     budget=budget,
                     validation_failures=failures,
@@ -923,9 +918,10 @@ class RuleGenerator:
                 result.points, expected, rel_tol=0.0, abs_tol=1e-9
             ):
                 mismatches.append(case.case_id)
-            if not math.isclose(
+            predicted = expectation_points.get(case.case_id)
+            if predicted is not None and not math.isclose(
                 result.points,
-                expectation_points[case.case_id],
+                predicted,
                 rel_tol=0.0,
                 abs_tol=1e-9,
             ):
@@ -968,8 +964,10 @@ class RuleGenerator:
         }
         for case in request.cases:
             case_results = execution.results_by_case_id[case.case_id]
-            actual = sum(case_results[question_id].points for question_id in question_ids)
-            maximum = sum(case_results[question_id].max_points for question_id in question_ids)
+            actual = sum(
+                result.points for qid, result in case_results.items() if qid in question_ids
+            )
+            maximum = sum(request.question_set.question_map[qid].max_points for qid in question_ids)
             expected = next(
                 (
                     label.expected_points
@@ -982,8 +980,9 @@ class RuleGenerator:
                 actual, expected, rel_tol=0.0, abs_tol=1e-9
             ):
                 mismatches.append(case.case_id)
-            if not math.isclose(
-                actual, expectation_points[case.case_id], rel_tol=0.0, abs_tol=1e-9
+            predicted = expectation_points.get(case.case_id)
+            if predicted is not None and not math.isclose(
+                actual, predicted, rel_tol=0.0, abs_tol=1e-9
             ):
                 expectation_mismatches.append(case.case_id)
             results.append(
@@ -997,9 +996,12 @@ class RuleGenerator:
                     expected_points=expected,
                     actual_points=actual,
                     max_points=maximum,
-                    passed=all(case_results[question_id].passed for question_id in question_ids),
+                    passed=all(result.passed for result in case_results.values()),
                     feedback="; ".join(
-                        case_results[question_id].feedback for question_id in question_ids
+                        case_results[qid].feedback
+                        if qid in case_results
+                        else f"No rule result for question {qid}."
+                        for qid in question_ids
                     ),
                 )
             )
@@ -1022,18 +1024,11 @@ class RuleGenerator:
         context: RuleContext,
     ) -> RegenerationContext:
         """Build sanitized feedback without disclosing engine exception details."""
-        if isinstance(error, CatalogValidationError):
-            reason_code = "candidate_validation_failed"
-            guidance = (
-                "The generated rule could not be validated for the trusted question context. "
-                "Revise the rule to use only the allowed rule family and fields."
-            )
-        else:
-            reason_code = "candidate_execution_failed"
-            guidance = (
-                "The deterministic engine could not execute the generated rule on the trusted "
-                "test cases. Revise the rule so it is valid and deterministic."
-            )
+        reason_code = "candidate_execution_failed"
+        guidance = (
+            "The deterministic engine could not execute the generated rule on the trusted "
+            "test cases. Revise the rule so it is valid and deterministic."
+        )
         return RegenerationContext(
             rule=authoring_payload(candidate, context) if candidate is not None else {},
             model_case_expectations=model_case_expectations,

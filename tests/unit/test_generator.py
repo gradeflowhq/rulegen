@@ -5,9 +5,10 @@ from collections.abc import Sequence
 from typing import Any
 
 import pytest
+from gradeflow_engine.exceptions import GradingError
 from gradeflow_engine.questions.models import ChoiceQuestion
 from gradeflow_engine.rubrics.model import Rubric
-from pydantic import TypeAdapter
+from pydantic import ConfigDict, TypeAdapter, ValidationError, create_model
 
 import rulegen.generator as generator_module
 import rulegen.hydration as hydration_module
@@ -34,7 +35,6 @@ from rulegen.models import ModelCaseExpectation
 from rulegen.prompts import payload_from_message
 from rulegen.requests import GenerationLimits
 from rulegen.teacher_actions import TeacherAction, TeacherActionRequest
-from rulegen.validation import CatalogValidationError
 from tests.support.authoring import hydrate_single
 from tests.support.completion import (
     TEST_LITELLM_CONFIG,
@@ -208,12 +208,12 @@ def test_generate_mixed_aggregates_all_success_as_verified(monkeypatch: pytest.M
 
 def test_invalid_later_target_causes_zero_dispatches(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = mixed_request().model_dump()
-    payload["tasks"][1]["evidence"]["labelled_cases"][0]["expected_points"] = 3
+    payload["tasks"][1]["target"]["allowed_rule_kinds"] = ["UNKNOWN"]
     request = GenerationRequest.model_validate(payload)
     generator, captured = _capturing_generator(monkeypatch, [])
     with pytest.raises(GenerationPreflightError) as error:
         asyncio.run(generator.generate_mixed(request))
-    assert error.value.issues[0].code == "expected_points_exceeds_target_maximum"
+    assert error.value.issues[0].code == "unsupported_allowed_rule_kinds"
     assert error.value.issues[0].target_id == 'group:["q2","q3"]'
     assert captured == []
 
@@ -232,7 +232,7 @@ def test_preflight_collects_issues_across_request_before_provider_calls() -> Non
                 TargetTask(
                     target=Target(
                         question_ids=["q4"],
-                        allowed_rule_kinds=["multiple_choice", "text_match"],
+                        allowed_rule_kinds=["MULTIPLE_CHOICE", "TEXT_MATCH"],
                     ),
                     evidence=TargetEvidence(
                         representative_cases=[
@@ -251,8 +251,6 @@ def test_preflight_collects_issues_across_request_before_provider_calls() -> Non
     with pytest.raises(GenerationPreflightError) as error:
         asyncio.run(RuleGenerator(TEST_LITELLM_CONFIG).generate_mixed(request))
     assert [issue.target_id for issue in error.value.issues] == [
-        "q1",
-        'group:["q2","q3"]',
         "q4",
         "q4",
     ]
@@ -303,7 +301,7 @@ def test_preparation_uses_supplied_request_without_mutation(
 
 def test_preparation_projects_only_declared_cases() -> None:
     request = preparation_request(
-        target=Target(question_ids=["q1"], allowed_rule_kinds=["text_match"]),
+        target=Target(question_ids=["q1"], allowed_rule_kinds=["TEXT_MATCH"]),
         evidence=TargetEvidence(
             labelled_cases=[TargetLabelledCase(case_id="label", expected_points=1)],
             representative_cases=[TargetRepresentativeCase(case_id="representative", count=3)],
@@ -327,7 +325,7 @@ def test_preparation_projects_only_declared_cases() -> None:
 
 def test_group_membership_and_declared_order_are_preserved() -> None:
     request = preparation_request(
-        target=Target(question_ids=["q2", "q1"], allowed_rule_kinds=["assumption_set_multi"]),
+        target=Target(question_ids=["q2", "q1"], allowed_rule_kinds=["ASSUMPTION_SET_MULTI"]),
         evidence=TargetEvidence(
             labelled_cases=[TargetLabelledCase(case_id="case", expected_points=2)]
         ),
@@ -344,7 +342,7 @@ def test_group_membership_and_declared_order_are_preserved() -> None:
 # Grouped retries and generation budgets
 
 
-def test_group_duplicate_rule_values_use_catalog_retry_after_hydration(
+def test_group_duplicate_rule_values_are_verified_without_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     duplicate_candidate = _candidate_payload()
@@ -352,7 +350,6 @@ def test_group_duplicate_rule_values_use_catalog_retry_after_hydration(
     client = ScriptedCompletion(
         [
             duplicate_candidate,
-            _candidate_payload(),
             _verification_payload,
         ]
     )
@@ -364,18 +361,13 @@ def test_group_duplicate_rule_values_use_catalog_retry_after_hydration(
         hydrated_strategies.append(result)
         return result
 
-    monkeypatch.setattr(hydration_module, "hydrate_rule", track_hydrate)
+    monkeypatch.setattr(generator_module, "hydrate_rule", track_hydrate)
     result = asyncio.run(RuleGenerator(TEST_LITELLM_CONFIG).generate_group(group_request()))
     assert result.status == "verified"
     assert client.requests[0]["response_format"]["json_schema"]["name"] == "SynthesisResponse"
-    assert len(client.calls) == 3
-    retry_payload = payload_from_message(client.calls[1][0][-1].content)
-    assert retry_payload["format_retry"]["reason"] == "local_shape_or_catalog_validation_failed"
-    assert retry_payload["format_retry"]["error_codes"] == ["duplicate_rule_values"]
-    assert retry_payload["format_retry"]["field_paths"] == ["result.rule"]
-    assert [strategy.type for strategy in hydrated_strategies] == [
-        "ASSUMPTION_SET_MULTI",
-        "ASSUMPTION_SET_MULTI",
+    assert len(client.calls) == 2
+    assert [data["assumptions"][0]["rules"][0]["answers"] for _, data in hydrated_strategies] == [
+        ["a", "a"]
     ]
 
 
@@ -407,12 +399,12 @@ def test_generate_group_promotes_ambiguous_no_safe_candidate_to_teacher_action()
 @pytest.mark.parametrize(
     ("target_options", "expected_kinds"),
     [
-        ({}, ["assumption_set_multi", "conditional_multi"]),
-        ({"allowed_rule_kinds": None}, ["assumption_set_multi", "conditional_multi"]),
-        ({"allowed_rule_kinds": ["assumption_set_multi"]}, ["assumption_set_multi"]),
+        ({}, ["ASSUMPTION_SET_MULTI", "CONDITIONAL"]),
+        ({"allowed_rule_kinds": None}, ["ASSUMPTION_SET_MULTI", "CONDITIONAL"]),
+        ({"allowed_rule_kinds": ["ASSUMPTION_SET_MULTI"]}, ["ASSUMPTION_SET_MULTI"]),
         (
-            {"allowed_rule_kinds": ["conditional_multi", "assumption_set_multi"]},
-            ["conditional_multi", "assumption_set_multi"],
+            {"allowed_rule_kinds": ["CONDITIONAL", "ASSUMPTION_SET_MULTI"]},
+            ["CONDITIONAL", "ASSUMPTION_SET_MULTI"],
         ),
     ],
 )
@@ -487,7 +479,7 @@ def test_group_budget_after_failed_regeneration_returns_no_proposal(
         nonlocal execution_calls
         execution_calls += 1
         if execution_calls == 2:
-            raise CatalogValidationError("candidate_execution_failed", path="rule")
+            raise GradingError("case-1", "q1", "candidate execution failed")
         return original_execute(*args, **kwargs)
 
     monkeypatch.setattr(generator_module, "execute_candidate_rule", execute_then_fail)
@@ -508,3 +500,37 @@ def test_group_budget_after_failed_regeneration_returns_no_proposal(
     assert result.status == "unresolved"
     assert result.reason == "LLM call budget exhausted"
     assert result.candidate is None
+
+
+def test_shape_diagnostics_are_sanitized_deduplicated_and_bounded():
+    from rulegen import LLMOutputValidationFailure
+    from rulegen.models import LLMOutputValidationFailure as ModelFailure
+
+    output_model = create_model(
+        "ManyFields",
+        __config__=ConfigDict(extra="forbid"),
+        **{f"field_{i}": (int, ...) for i in range(25)},
+    )
+    with pytest.raises(ValidationError) as rejected:
+        output_model.model_validate({"secret_invented_field": "secret_input"})
+    failure = generator_module.shape_validation_failure(
+        rejected.value, phase="verification", attempt=2
+    )
+    assert LLMOutputValidationFailure is ModelFailure
+    assert isinstance(failure, LLMOutputValidationFailure)
+    assert failure.phase == "verification"
+    assert failure.attempt == 2
+    assert failure.kind == "shape"
+    assert failure.error_codes == ("missing", "extra_forbidden")
+    assert failure.field_paths == tuple(f"field_{i}" for i in range(20))
+    assert "secret" not in repr(failure)
+
+
+def test_shape_diagnostics_represent_root_errors():
+    with pytest.raises(ValidationError) as rejected:
+        TypeAdapter(int).validate_python({"secret_input": "value"})
+    failure = generator_module.shape_validation_failure(
+        rejected.value, phase="synthesis", attempt=0
+    )
+    assert failure.field_paths == ("$",)
+    assert "secret" not in repr(failure)

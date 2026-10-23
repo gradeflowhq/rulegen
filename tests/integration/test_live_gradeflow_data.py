@@ -16,20 +16,12 @@ from pydantic import TypeAdapter, ValidationError
 
 import rulegen.generator as rulegen_generator
 from rulegen import RuleGenerationResult, RuleGenerator
-from rulegen.llm_payloads import LLMGroupGenerationRequest, build_llm_generation_payload
-from rulegen.models import NoSafeCandidate, SynthesisResponse, VerificationResult
+from rulegen.generator import shape_validation_failure
+from rulegen.llm_payloads import build_llm_generation_payload
+from rulegen.models import CallPhase, NoSafeCandidate, SynthesisResponse, VerificationResult
 from rulegen.preflight import preflight_check
 from rulegen.registry import resolve_target_rule_kinds
 from rulegen.requests import GenerationRequest
-from rulegen.validation import (
-    CallPhase,
-    CatalogValidationError,
-    GroupValidationContext,
-    _validate_group_synthesis_catalog,
-    _validate_synthesis_catalog,
-    catalog_validation_failure,
-    shape_validation_failure,
-)
 from tests.support.gradeflow_data import _build_request, _GradeFlowDataFixture, _load_fixture
 from tests.support.live_soc import live_soc_configuration
 
@@ -147,24 +139,6 @@ async def _generate_live(
                 try:
                     if validation_phase == "synthesis":
                         parsed = TypeAdapter(SynthesisResponse).validate_json(raw_completion)
-                        preflight_check(request)
-                        task = request.tasks[0]
-                        llm_request = build_llm_generation_payload(
-                            request=request,
-                            task=task,
-                            resolved_rule_kinds=resolve_target_rule_kinds(
-                                request.question_set,
-                                task.target.question_ids,
-                                task.target.allowed_rule_kinds,
-                            ),
-                        )
-                        if isinstance(llm_request, LLMGroupGenerationRequest):
-                            _validate_group_synthesis_catalog(
-                                parsed,
-                                GroupValidationContext(llm_request, request.question_set),
-                            )
-                        else:
-                            _validate_synthesis_catalog(parsed, llm_request)
                         if isinstance(parsed, NoSafeCandidate):
                             if raw_object is not None:
                                 candidate_explanation = parsed.result.explanation
@@ -174,15 +148,6 @@ async def _generate_live(
                         TypeAdapter(VerificationResult).validate_json(raw_completion)
                 except ValidationError as exc:
                     failure = shape_validation_failure(exc, phase=validation_phase, attempt=0)
-                    shape_errors = [
-                        {
-                            "kind": failure.kind,
-                            "error_codes": list(failure.error_codes),
-                            "field_paths": list(failure.field_paths),
-                        }
-                    ]
-                except CatalogValidationError as exc:
-                    failure = catalog_validation_failure(exc, phase=validation_phase, attempt=0)
                     shape_errors = [
                         {
                             "kind": failure.kind,

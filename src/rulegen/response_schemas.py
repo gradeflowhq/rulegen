@@ -7,9 +7,8 @@ from pydantic import TypeAdapter
 
 from .authoring import AuthoringSchema, provider_schema
 from .llm import JSONSchema
-from .llm_payloads import LLMGenerationRequest, LLMGroupGenerationRequest
+from .llm_payloads import LLMGenerationRequest, LLMGroupGenerationRequest, generation_context
 from .models import SynthesisResponse, VerificationResult
-from .validation import generation_context
 
 
 def synthesis_response_schema(request: LLMGenerationRequest) -> JSONSchema:

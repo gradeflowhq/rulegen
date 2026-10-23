@@ -42,7 +42,7 @@ def _request() -> GenerationRequest:
         ),
         tasks=(
             TargetTask(
-                target=Target(question_ids=["q1"], allowed_rule_kinds=["text_match"]),
+                target=Target(question_ids=["q1"], allowed_rule_kinds=["TEXT_MATCH"]),
                 evidence=TargetEvidence(
                     labelled_cases=[TargetLabelledCase(case_id="positive", expected_points=1)],
                     representative_cases=[TargetRepresentativeCase(case_id="negative", count=3)],
@@ -83,7 +83,7 @@ def test_later_invalid_task_blocks_all_llm_calls() -> None:
     payload["tasks"] = (
         *payload["tasks"],
         {
-            "target": {"question_ids": ["secret"], "allowed_rule_kinds": ["text_match"]},
+            "target": {"question_ids": ["secret"], "allowed_rule_kinds": ["NOT_A_RULE"]},
             "evidence": {"labelled_cases": [{"case_id": "positive", "expected_points": 2}]},
         },
     )
@@ -91,7 +91,7 @@ def test_later_invalid_task_blocks_all_llm_calls() -> None:
     client = ScriptedCompletion([])
     with pytest.raises(GenerationPreflightError) as error:
         asyncio.run(RuleGenerator(TEST_LITELLM_CONFIG).generate_mixed(request))
-    assert error.value.issues[0].code == "expected_points_exceeds_target_maximum"
+    assert error.value.issues[0].code == "unsupported_allowed_rule_kinds"
     assert error.value.issues[0].target_id == "secret"
     assert client.calls == []
 
@@ -107,7 +107,7 @@ def test_incomplete_canonical_choice_context_raises_preflight_error(entrypoint: 
         cases=(CandidateTestCase(case_id="blank", answer_map={"choice": None}),),
         tasks=(
             TargetTask(
-                target=Target(question_ids=["choice"], allowed_rule_kinds=["multiple_choice"]),
+                target=Target(question_ids=["choice"], allowed_rule_kinds=["MULTIPLE_CHOICE"]),
                 evidence=TargetEvidence(
                     representative_cases=[TargetRepresentativeCase(case_id="blank", count=1)]
                 ),
@@ -129,7 +129,7 @@ def test_canonical_per_target_budget_is_independent() -> None:
     for case in request.cases:
         case.answer_map["q2"] = case.answer_map["q1"]
     second = TargetTask(
-        target=Target(question_ids=["q2"], allowed_rule_kinds=["text_match"]),
+        target=Target(question_ids=["q2"], allowed_rule_kinds=["TEXT_MATCH"]),
         evidence=request.tasks[0].evidence.model_copy(deep=True),
     )
     request = type(request).model_validate(

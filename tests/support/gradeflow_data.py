@@ -111,7 +111,7 @@ def _build_request(
             TargetTask(
                 target=Target(
                     question_ids=[source_question.question_id],
-                    allowed_rule_kinds=["multiple_choice"],
+                    allowed_rule_kinds=["MULTIPLE_CHOICE"],
                 ),
                 evidence=evidence,
             ),
